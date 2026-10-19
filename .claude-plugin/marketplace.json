@@ -1,0 +1,14 @@
+{
+  "name": "alethe",
+  "description": "Alethe's agent skills for running several coding agents together.",
+  "owner": {
+    "name": "Kauã Miguel"
+  },
+  "plugins": [
+    {
+      "name": "alethe-orchestrate",
+      "source": "./",
+      "description": "Orchestrate CLI agents with playbooks that save context and quota, and report what each run did and cost."
+    }
+  ]
+}

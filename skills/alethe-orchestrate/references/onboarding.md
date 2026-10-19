@@ -1,0 +1,77 @@
+# Orchestration onboarding
+
+Use this when the user asks to set up the skill or `doctor` finds no saved policy. The result is a
+playbooks copy that lists what the user really has, three profiles built from it, and the user's
+approval. Ask only what you cannot find out; skip answers already given in the request or saved
+policy.
+
+## 1. Take inventory
+
+1. Run `doctor` for the built-in CLIs: Codex, Claude Code, Agy / Antigravity and Kimi Code.
+2. Look on PATH for other agent CLIs, such as `gemini`, `kiro-cli`, `copilot` or `opencode`, and for
+   routes such as `9router`. Run each one's `--help` before counting it; a CLI that fails to start
+   goes in the notes with the fix, not in `providers`. Ask: "Is there another AI CLI or routing
+   tool you want to use?" Accept a name or executable path.
+3. List each CLI's models when it has a command for that, such as `agy models` or
+   `kiro-cli chat --list-models --format json`. Keep cost multipliers the CLI reports.
+4. Record a custom adapter only after `--help` shows a non-interactive prompt mode, and write down
+   the command you checked. Never guess flags or credentials. A custom adapter cannot enforce
+   read-only work, so it only takes writing phases; see [providers.md](providers.md).
+5. Alethe reads Claude, Codex, Antigravity and Kimi usage. Ask about plan end dates, and about the
+   usage of the other CLIs, only when a profile depends on them.
+6. For a route such as 9router, record whether it is installed and running and which CLIs the user
+   wants it to carry. A route is a separate diagram node, not a worker. Inspect the app
+   configuration or environment before calling it active, and never start, install or reconfigure
+   it.
+
+## 2. Build three profiles
+
+Write three profiles over the same playbooks, using only models the inventory found:
+
+| Profile | Tiers | Order | Switches at |
+| --- | --- | --- | --- |
+| Base | Each CLI's usual model per tier | The user's main CLIs first | 80% |
+| Savings | One step cheaper per tier; low-multiplier and separate quotas for volume | Cheapest capable CLI first, the scarcest subscription last | 70% |
+| Aggressive | One step stronger per tier; `xhigh` still only on escalation | The strongest CLIs first | 95% |
+
+Keep a model empty when the CLI's default is the right choice. Put a read-only phase only where the
+CLI enforces read-only work.
+
+## 3. Ask for approval
+
+Show the inventory in a few lines: found, skipped with the reason, and routes. Then show one table
+with the three profiles and the model each tier gets on each CLI. Recommend one and ask: "Approve
+these profiles, and which one should be active?" Apply changes and show the table again. Never
+save or start workers before the user approves.
+
+## 4. Save
+
+1. Run `playbook --init`, adding `--force` only after the user agreed to replace an existing copy,
+   and edit the copy it prints: `setup` (date and notes), `providers`, `models`, `adapters`,
+   `routes`, `tiers`, `profiles` and `profile`, as [playbooks.md](playbooks.md) describes.
+2. Run `policy set --provider-order` with the active profile's built-in CLIs, or `policy set` with
+   no options when the defaults fit, so `doctor` records onboarding as complete. A choice limited
+   to one run stays out of the policy.
+3. Offer a preview diagram of the active profile.
+
+Later, "use savings" or "go aggressive" changes `profile` in the copy; confirm it when it is an
+ongoing change, or apply it to this run only.
+
+## Ready-made routes
+
+These are starting points for a wave's runner strategy, not claims that a model is available or
+cheapest. Always `probe` before selecting a worker; the local CLI and the user's request take
+precedence.
+
+| Goal | Suggested plan | Typical provider choice |
+| --- | --- | --- |
+| Save usage | One bounded reader or writer, `economy`, cheap tier when configured | First available preferred CLI |
+| Everyday work | Two independent units, `balanced` | Codex and Claude Code, or two isolated units on one CLI |
+| Independent review | Writer, then reviewer, then repair only if needed, `quality` | Review with a different available CLI when possible |
+| Compare findings | Two or more read-only investigations, `research` | Mix available CLIs for independent views |
+| Implement independent pieces | Disjoint writers in isolated worktrees, `parallel` | Available writing CLIs with explicit file ownership |
+| Recover a session | One resumed worker, `rescue` | The same CLI that owns the session ID |
+
+9router routes an agent's API traffic and can be drawn between that agent and its upstream model.
+It does not replace the CLI adapter or reveal which upstream model a request used unless that
+information is available from the configuration or observed run data.
