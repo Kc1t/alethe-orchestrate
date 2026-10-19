@@ -253,13 +253,15 @@ class RunnerTest(Fixtures):
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(out)["skill"]["version"], version)
 
-    def test_codex_plugin_manifests_carry_the_skill_version(self):
-        expected = f"{orchestrate.skill_version()}.0.0"
+    def test_plugin_manifests_and_readme_carry_the_skill_version(self):
+        version = orchestrate.skill_version()
+        expected = f"{version}.0.0"
         plugin = json.loads((ROOT / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))
         marketplace = json.loads((ROOT / ".agents" / "plugins" / "marketplace.json").read_text(encoding="utf-8"))
         self.assertEqual(plugin["version"], expected)
         self.assertEqual([entry["version"] for entry in marketplace["plugins"]], [expected])
         self.assertTrue((ROOT / plugin["skills"] / "alethe-orchestrate" / "SKILL.md").is_file())
+        self.assertIn(f"badge/skill-v{version}-", (ROOT / "README.md").read_text(encoding="utf-8"))
 
     @unittest.skipUnless(os.name == "nt", "batch files exist only on Windows")
     def test_npm_style_shims_receive_the_whole_prompt(self):
