@@ -3,6 +3,52 @@
 The version is the integer in `skills/alethe-orchestrate/SKILL.md` under `metadata.version`.
 Alethe installs and updates the skill by that number.
 
+## 12 (2026-10-19)
+
+Fixed:
+
+- On Windows, npm installs CLIs as `.cmd` shims, and cmd.exe cut a prompt passed as an argument at
+  its first newline. Kimi workers lost everything after the first line of their task, including
+  the worker contract, and a quote in a task could run another command. The runner now launches
+  the shim's real target directly, and refuses risky arguments for a batch file it cannot read.
+- Kimi write workers failed at startup: Kimi refuses `--yolo` with `--prompt`. Kimi's prompt mode
+  always approves every tool, so `auto` no longer sends read-only work to Kimi.
+- Codex resumed sessions without the worker's sandbox or effort.
+- A Claude worker that timed out left no session id to resume; Claude now streams its events.
+- A large prompt sent through stdin could block the runner before any deadline applied.
+- On macOS and Linux, a child process that ignored the stop signal survived a timeout.
+- A writer in a repository with no commits lost its result; it now succeeds with no diff.
+- A stray non-JSON line made a worker's whole output unreadable.
+- Workers whose CLI prints plain text now get a `result.md` too.
+- The saved-policy note said Alethe erased budgets and model tiers, which it no longer does.
+
+Added:
+
+- `budget <folder>` sets limits on calls, reported cost and reported tokens for every wave of an
+  orchestration, enforced by each run.
+- Plan budgets take `maxReportedTokens`, the limit that covers CLIs that report no cost. Claude
+  workers also get their share of the cost limit as `--max-budget-usd`.
+- Codex and Claude workers cannot start subagents, and start without MCP servers unless a worker
+  sets `mcp: true`. Every worker runs with `ALETHE_ORCHESTRATE_WORKER=1`, and `run` refuses to start
+  inside one.
+- Workers end with a `STATUS:` and a `SUMMARY:` line, and validators with a `VERDICT:` line. The
+  runner reads them, and the report lists blocked, doubtful and failed work with what to do next.
+- A read-only tripwire compares the checkout before and after each read-only worker, and a writer
+  in the main checkout records which files already had changes.
+- Each outcome has a `failureKind`, such as `rate_limited` or `auth_required`, read from the logs,
+  plus the tools Claude denied and the models it billed.
+- `mark` records whether a result was used, partly used or discarded; the report then splits the
+  spend between them.
+- `status <folder>` prints where an orchestration stands, for picking it up after compaction.
+- `idleTimeoutSeconds` stops a worker that prints nothing for that long; `state.json` shows each
+  running worker's output size and idle time.
+- `validate` and `dry-run` warn about blind cost limits, unpinned models, briefs too small to
+  delegate, Kimi read-only work, MCP mentions and writers in a checkout with uncommitted changes.
+- `doctor` says whether each CLI is logged in.
+- `references/briefs.md` covers writing a brief, reviews, adversarial reviews, validator verdicts
+  and panels. Playbooks gain a `risky` condition, and review-gate asks for a verdict.
+- The repository is also a Codex plugin marketplace.
+
 ## 11 (2026-10-18)
 
 First version published from its own repository. Earlier versions shipped inside Alethe.

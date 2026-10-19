@@ -6,7 +6,9 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import datetime as dt
+import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -40,6 +42,8 @@ UNSAFE_FLAGS = {
     "--allow-all-tools",
     "--yolo",
 }
+BATCH_SUFFIXES = (".cmd", ".bat")
+BATCH_UNSAFE = re.compile(r'["&|<>^%!\r\n]')
 PROVIDER_ALIASES = {"antigravity": "agy"}
 BUILTIN_PROVIDERS = ("codex", "claude", "agy", "kimi")
 PROVIDER_CAPABILITIES: Dict[str, Dict[str, bool]] = {
@@ -66,7 +70,7 @@ PROVIDER_CAPABILITIES: Dict[str, Dict[str, bool]] = {
     },
     "kimi": {
         "structuredOutput": True,
-        "readOnly": True,
+        "readOnly": False,
         "write": True,
         "resume": True,
         "tokenUsage": False,
@@ -130,10 +134,58 @@ DEFAULT_POLICY: Dict[str, Any] = {
     "budget": {},
     "modelTiers": {},
 }
-BUDGET_FIELDS = ("maxCalls", "maxWallSeconds", "maxEstimatedPromptTokens", "maxReportedCostUsd")
+BUDGET_FIELDS = (
+    "maxCalls",
+    "maxWallSeconds",
+    "maxEstimatedPromptTokens",
+    "maxReportedCostUsd",
+    "maxReportedTokens",
+)
+ORCHESTRATION_BUDGET_FIELDS = ("maxCalls", "maxReportedCostUsd", "maxReportedTokens")
+ORCHESTRATION_BUDGET_FILE = "budget.json"
 MAX_BUDGET_CALLS = 64
 MODEL_TIERS = ("cheap", "standard", "strong")
 MODEL_TIER_KEYS = ("cheap", "strong")
+COST_REPORTING_PROVIDERS = ("claude",)
+ARGUMENT_PROMPT_LIMIT = 30000 if os.name == "nt" else 100000
+WORKER_ENV_FLAG = "ALETHE_ORCHESTRATE_WORKER"
+POLL_SECONDS = 1.0
+STATE_REFRESH_SECONDS = 5.0
+FINGERPRINT_MAX_BYTES = 20 * 1024 * 1024
+SNAPSHOT_LIMIT = 5000
+MAX_LISTED_PATHS = 50
+NESTED_AGENT_FEATURES = ("multi_agent", "multi_agent_v2")
+CLAUDE_AGENT_TOOLS = "Agent,Workflow"
+WORKER_STATUSES = ("DONE", "DONE_WITH_CONCERNS", "BLOCKED", "NEEDS_CONTEXT")
+VERDICTS = ("PASS", "FAIL", "NOT_PROVEN")
+MARKS = ("used", "partial", "discarded")
+SHORT_TASK_CHARS = 400
+HANDOFF_LINE = re.compile(
+    r"^[\s>*_`#-]*(STATUS|SUMMARY|VERDICT)[*_`]*\s*:[*_`\s]*(.+?)[*_`\s]*$", re.MULTILINE | re.IGNORECASE
+)
+FAILURE_HINTS = {
+    "rate_limited": "the provider hit a usage limit; run the unit on the next provider in the order, or after the reset",
+    "auth_required": "log in to the CLI or check its subscription, then run the unit again",
+    "not_installed": "install the CLI or pick another provider",
+    "stalled": "it went quiet for too long; resume its session or narrow the task",
+    "timed_out": "it ran out of time; resume its session or narrow the task",
+    "budget": "a budget stopped it; raise the budget or drop the unit",
+    "budget_exceeded": "its own cost cap stopped it; raise maxReportedCostUsd or narrow the task",
+    "invalid_output": "its output did not parse; check stderr.log and the CLI version",
+}
+ERROR_LINE = re.compile(r"\berror\b|\bfailed\b|denied|forbidden|exception|\b4\d\d\b|\b5\d\d\b", re.IGNORECASE)
+FAILURE_PATTERNS = (
+    ("rate_limited", re.compile(r"\b429\b|rate.?limit|usage limit|quota|too many requests|hit your (?:\w+ )?limit", re.I)),
+    (
+        "auth_required",
+        re.compile(
+            r"\b40[13]\b|auth_error|unauthori[sz]ed|forbidden|not logged in|please log ?in|login required"
+            r"|invalid api key|subscription does not have access",
+            re.I,
+        ),
+    ),
+    ("budget_exceeded", re.compile(r"max.?budget|budget exceeded", re.I)),
+)
 WORKER_CONTRACT = """
 
 Runtime contract:
@@ -141,6 +193,9 @@ Runtime contract:
 - Do not delegate, spawn subagents, or launch another agent CLI.
 - Do not commit, push, tag, release, or open a pull request.
 - End with a concise handoff: outcome, evidence, files changed, checks run, failures, and risks.
+- Finish with a line `STATUS: DONE`, `STATUS: DONE_WITH_CONCERNS`, `STATUS: BLOCKED` or
+  `STATUS: NEEDS_CONTEXT`, then a line `SUMMARY: <one sentence>`. Use BLOCKED or NEEDS_CONTEXT
+  instead of guessing, and put what you need in the handoff.
 """.strip()
 
 
@@ -299,6 +354,11 @@ def validate_budget(raw: Any, label: str) -> Dict[str, Any]:
         if not isinstance(max_cost, (int, float)) or isinstance(max_cost, bool) or max_cost <= 0:
             raise PlanError(f"{label}.maxReportedCostUsd must be a positive number")
         budget["maxReportedCostUsd"] = max_cost
+    max_reported = raw.get("maxReportedTokens")
+    if max_reported is not None:
+        if not isinstance(max_reported, int) or isinstance(max_reported, bool) or max_reported < 1:
+            raise PlanError(f"{label}.maxReportedTokens must be a positive integer")
+        budget["maxReportedTokens"] = max_reported
     return budget
 
 
@@ -454,10 +514,13 @@ def choose_provider(requested: str, worker: Dict[str, Any], policy: Dict[str, An
         return requested
     available = available_builtin_providers()
     conserved = set(policy["conserveProviders"])
+    read_only = worker.get("mode") == "read-only"
     candidates = [
         provider
         for provider in policy["providerOrder"]
-        if provider in available and provider not in conserved
+        if provider in available
+        and provider not in conserved
+        and (not read_only or PROVIDER_CAPABILITIES[provider]["readOnly"])
     ]
     if worker.get("resume") and requested == "auto":
         raise PlanError(
@@ -467,7 +530,8 @@ def choose_provider(requested: str, worker: Dict[str, Any], policy: Dict[str, An
         if worker.get("model") or worker.get("effort"):
             raise PlanError(f"worker {worker['id']} cannot combine provider auto with model or effort")
         if not candidates:
-            raise PlanError("no unconserved built-in provider is available")
+            needed = "read-only " if read_only else ""
+            raise PlanError(f"no unconserved built-in provider can run a {needed}worker")
         return candidates[0]
     if requested not in conserved:
         return requested
@@ -663,6 +727,8 @@ def validate_plan(
             "promptTransport",
             "outputFormat",
             "allowUnsafe",
+            "mcp",
+            "idleTimeoutSeconds",
         }
         if unknown:
             raise PlanError(
@@ -711,6 +777,14 @@ def validate_plan(
         resume = optional_name(item.get("resume"), f"worker {worker_id}.resume")
         if resume and isolate:
             raise PlanError(f"worker {worker_id} cannot combine resume with isolate")
+        mcp = item.get("mcp", False)
+        if not isinstance(mcp, bool):
+            raise PlanError(f"worker {worker_id} mcp must be a boolean")
+        idle_timeout = item.get("idleTimeoutSeconds")
+        if idle_timeout is not None and (
+            not isinstance(idle_timeout, int) or isinstance(idle_timeout, bool) or not 5 <= idle_timeout <= 86400
+        ):
+            raise PlanError(f"worker {worker_id} idleTimeoutSeconds must be between 5 and 86400")
         task = load_task(item, plan_path.parent)
         normalized = {
             "id": worker_id,
@@ -726,6 +800,8 @@ def validate_plan(
             "effort": effort,
             "tier": tier,
             "resume": resume,
+            "mcp": mcp,
+            "idleTimeoutSeconds": idle_timeout,
             "task": task,
         }
         if requested_provider == "custom":
@@ -741,6 +817,14 @@ def validate_plan(
                 f"conserved provider {requested_provider} replaced by providerSwitch=automatic"
             )
         resolve_model_tier(normalized, policy)
+        prompt_in_argument = chosen_provider in ("agy", "kimi") or (
+            chosen_provider == "custom" and normalized["promptTransport"] == "argument"
+        )
+        if prompt_in_argument and len(task) > ARGUMENT_PROMPT_LIMIT:
+            raise PlanError(
+                f"worker {worker_id} task is {len(task)} characters, but {chosen_provider} takes its prompt "
+                f"as an argument limited to {ARGUMENT_PROMPT_LIMIT} here; shorten it or point to files"
+            )
         normalized["estimatedPromptTokens"] = estimated_prompt_tokens(task)
         normalized_workers.append(normalized)
 
@@ -805,14 +889,20 @@ def validate_custom(worker: Dict[str, Any], worker_id: str) -> Dict[str, Any]:
     }
 
 
-def run_git(cwd: Path, args: Sequence[str], input_bytes: Optional[bytes] = None) -> bytes:
-    result = subprocess.run(
-        ["git", "-C", str(cwd), *args],
-        input=input_bytes,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
+def run_git(
+    cwd: Path, args: Sequence[str], input_bytes: Optional[bytes] = None, timeout: float = 300
+) -> bytes:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(cwd), *args],
+            input=input_bytes,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise PlanError(f"git {' '.join(args)} timed out after {timeout:g}s") from error
     if result.returncode != 0:
         message = result.stderr.decode("utf-8", errors="replace").strip()
         raise PlanError(f"git {' '.join(args)} failed: {message}")
@@ -898,25 +988,33 @@ def prepare_worktree(worker: Dict[str, Any], run_id: str) -> Path:
     return target
 
 
-def command_help(executable: str, cache: Dict[str, str], lock: threading.Lock) -> str:
+def command_output(args: Sequence[str], cache: Dict[str, str], lock: threading.Lock) -> str:
+    key = "\0".join(args)
     with lock:
-        if executable in cache:
-            return cache[executable]
+        if key in cache:
+            return cache[key]
     try:
         result = subprocess.run(
-            [executable, "--help"],
+            list(args),
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            timeout=8,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
             check=False,
         )
-        output = result.stdout
+        output = result.stdout or ""
     except (OSError, subprocess.TimeoutExpired):
         output = ""
     with lock:
-        cache[executable] = output
+        cache[key] = output
     return output
+
+
+def command_help(launch: Sequence[str], cache: Dict[str, str], lock: threading.Lock) -> str:
+    return command_output([*launch, "--help"], cache, lock)
 
 
 def resolve_executable(name: str) -> str:
@@ -930,6 +1028,56 @@ def resolve_executable(name: str) -> str:
     if not resolved:
         raise PlanError(f"executable not found on PATH: {name}")
     return resolved
+
+
+def is_batch_file(executable: str) -> bool:
+    return os.name == "nt" and Path(executable).suffix.lower() in BATCH_SUFFIXES
+
+
+def shim_target(shim: Path) -> Optional[List[str]]:
+    try:
+        text = shim.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    lines = [line for line in text.splitlines() if "%*" in line]
+    if not lines:
+        return None
+    head = lines[-1].split("%*", 1)[0].rsplit("&", 1)[-1]
+    tokens = re.findall(r'"([^"]+)"', head)
+    if not tokens or re.sub(r'"[^"]*"', "", head).strip():
+        return None
+    folder = str(shim.parent) + "\\"
+    launch: List[str] = []
+    for token in tokens:
+        if token == "%_prog%":
+            bundled = shim.parent / "node.exe"
+            node = str(bundled) if bundled.is_file() else shutil.which("node")
+            if not node:
+                return None
+            launch.append(node)
+            continue
+        value = token.replace("%~dp0", folder).replace("%dp0%", folder)
+        if "%" in value or not Path(value).is_file():
+            return None
+        launch.append(str(Path(value).resolve()))
+    return launch
+
+
+def launch_command(executable: str) -> List[str]:
+    if not is_batch_file(executable):
+        return [executable]
+    # cmd.exe cuts a batch argument at a newline and runs what follows an unbalanced quote.
+    return shim_target(Path(executable)) or [executable]
+
+
+def refuse_batch_arguments(args: Sequence[str]) -> None:
+    if not is_batch_file(args[0]):
+        return
+    if any(BATCH_UNSAFE.search(arg) for arg in args[1:]):
+        raise PlanError(
+            f"{Path(args[0]).name} is a batch file and cmd.exe would rewrite its arguments; "
+            "point the worker at the real executable or send the prompt through stdin"
+        )
 
 
 def in_git_worktree(cwd: Path) -> bool:
@@ -948,6 +1096,7 @@ def build_invocation(
     help_cache: Dict[str, str],
     help_lock: threading.Lock,
     timeout: int,
+    cost_cap: Optional[float] = None,
 ) -> Tuple[List[str], bool, str, Path]:
     provider = worker["provider"]
     mode = worker["mode"]
@@ -957,60 +1106,70 @@ def build_invocation(
     result_path = worker_dir / "result.md"
 
     if provider == "codex":
-        executable = resolve_executable("codex")
+        launch = launch_command(resolve_executable("codex"))
+        features = command_output([*launch, "features", "list"], help_cache, help_lock)
+        args = list(launch)
+        for feature in NESTED_AGENT_FEATURES:
+            if re.search(rf"^{feature}\s", features, re.MULTILINE):
+                args += ["--disable", feature]
+        sandbox = "read-only" if mode == "read-only" else "workspace-write"
+        args += ["exec", "--sandbox", sandbox]
         if resume:
-            args = [executable, "exec", "resume", "--json", "-o", str(result_path)]
-            if model:
-                args += ["--model", model]
-            if not in_git_worktree(cwd):
-                args.append("--skip-git-repo-check")
-            args += [resume, "-"]
-        else:
-            sandbox = "read-only" if mode == "read-only" else "workspace-write"
-            args = [
-                executable,
-                "exec",
-                "--json",
-                "--sandbox",
-                sandbox,
-                "--cd",
-                str(cwd),
-                "--output-last-message",
-                str(result_path),
-            ]
-            if model:
-                args += ["--model", model]
-            if effort:
-                args += ["--config", f'model_reasoning_effort="{effort}"']
-            if not in_git_worktree(cwd):
-                args.append("--skip-git-repo-check")
-            args.append("-")
+            args.append("resume")
+        args += ["--json", "--output-last-message", str(result_path)]
+        if not resume:
+            args += ["--cd", str(cwd)]
+        if model:
+            args += ["--model", model]
+        if effort:
+            args += ["--config", f"model_reasoning_effort={effort}"]
+        if not worker["mcp"]:
+            args += ["--config", "mcp_servers={}"]
+        if not in_git_worktree(cwd):
+            args.append("--skip-git-repo-check")
+        if resume:
+            args.append(resume)
+        args.append("-")
         return args, True, "jsonl", result_path
 
     if provider == "claude":
-        executable = resolve_executable("claude")
+        launch = launch_command(resolve_executable("claude"))
         permission = "plan" if mode == "read-only" else "acceptEdits"
-        args = [executable, "--print", "--output-format", "json", "--permission-mode", permission]
-        help_text = command_help(executable, help_cache, help_lock)
+        args = [
+            *launch,
+            "--print",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--permission-mode",
+            permission,
+        ]
+        help_text = command_help(launch, help_cache, help_lock)
         if "--permission-prompts" in help_text:
             args += ["--permission-prompts", "none"]
         if "--disable-slash-commands" in help_text:
             args.append("--disable-slash-commands")
+        if "--disallowedTools" in help_text:
+            args += ["--disallowedTools", CLAUDE_AGENT_TOOLS]
+        if not worker["mcp"] and "--strict-mcp-config" in help_text:
+            args.append("--strict-mcp-config")
+        if cost_cap is not None and "--max-budget-usd" in help_text:
+            args += ["--max-budget-usd", f"{cost_cap:.2f}"]
         if model:
             args += ["--model", model]
         if effort:
             args += ["--effort", effort]
         if resume:
             args += ["--resume", resume]
-        return args, True, "json", result_path
+        return args, True, "jsonl", result_path
 
     if provider == "agy":
-        executable = resolve_executable("agy")
+        launch = launch_command(resolve_executable("agy"))
         agent_mode = "plan" if mode == "read-only" else "accept-edits"
         # The prompt must be attached to --print: agy otherwise treats the next flag as the
         # prompt and drops the real one.
         args = [
-            executable,
+            *launch,
             "--output-format",
             "json",
             "--mode",
@@ -1018,9 +1177,11 @@ def build_invocation(
             "--print-timeout",
             f"{timeout}s",
         ]
-        help_text = command_help(executable, help_cache, help_lock)
+        help_text = command_help(launch, help_cache, help_lock)
         if "--disable-slash-commands" in help_text:
             args.append("--disable-slash-commands")
+        if "--add-dir" in help_text:
+            args += ["--add-dir", str(cwd)]
         if model:
             args += ["--model", model]
         if effort:
@@ -1031,19 +1192,17 @@ def build_invocation(
         return args, False, "json", result_path
 
     if provider == "kimi":
-        executable = resolve_executable("kimi")
-        args = [executable, "--prompt", worker["task"], "--output-format", "stream-json"]
-        # --plan cannot combine with --prompt; read-only relies on the worker contract and
-        # Kimi's default ask mode instead.
-        if mode != "read-only":
-            args.append("--yolo")
+        launch = launch_command(resolve_executable("kimi"))
+        # Prompt mode always runs in Kimi's auto permission mode and refuses --plan and --yolo.
+        args = [*launch, "--output-format", "stream-json"]
         if model:
             args += ["--model", model]
         if resume:
             args += ["--session", resume]
+        args.append(f"--prompt={worker['task']}")
         return args, False, "jsonl", result_path
 
-    executable = resolve_executable(worker["command"])
+    launch = launch_command(resolve_executable(worker["command"]))
     replacements = {"{cwd}": str(cwd), "{result}": str(result_path)}
     custom_args = []
     for raw in worker["args"]:
@@ -1054,10 +1213,24 @@ def build_invocation(
     stdin_prompt = worker["promptTransport"] == "stdin"
     if not stdin_prompt:
         custom_args.append(worker["task"])
-    return [executable, *custom_args], stdin_prompt, worker["outputFormat"], result_path
+    return [*launch, *custom_args], stdin_prompt, worker["outputFormat"], result_path
 
 
-def start_process(args: Sequence[str], cwd: Path, stdin: Any, stdout: Any, stderr: Any) -> subprocess.Popen:
+def worker_environment() -> Dict[str, str]:
+    environment = {key: value for key, value in os.environ.items() if key != "CLAUDECODE"}
+    environment[WORKER_ENV_FLAG] = "1"
+    return environment
+
+
+def start_process(
+    args: Sequence[str],
+    cwd: Path,
+    stdin: Any,
+    stdout: Any,
+    stderr: Any,
+    env: Optional[Dict[str, str]] = None,
+) -> subprocess.Popen:
+    refuse_batch_arguments(args)
     options: Dict[str, Any] = {
         "args": list(args),
         "cwd": str(cwd),
@@ -1065,6 +1238,7 @@ def start_process(args: Sequence[str], cwd: Path, stdin: Any, stdout: Any, stder
         "stdout": stdout,
         "stderr": stderr,
         "shell": False,
+        "env": env,
     }
     if os.name == "nt":
         options["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
@@ -1074,24 +1248,27 @@ def start_process(args: Sequence[str], cwd: Path, stdin: Any, stdout: Any, stder
 
 
 def stop_process_tree(process: subprocess.Popen) -> None:
-    if process.poll() is not None:
-        return
     if os.name == "nt":
-        subprocess.run(
-            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
+        if process.poll() is None:
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
     else:
         try:
             os.killpg(process.pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
             process.wait(timeout=3)
-        except (ProcessLookupError, subprocess.TimeoutExpired):
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
     try:
         process.wait(timeout=5)
     except subprocess.TimeoutExpired:
@@ -1099,16 +1276,80 @@ def stop_process_tree(process: subprocess.Popen) -> None:
         process.wait()
 
 
+def feed_stdin(stream: Any, data: bytes) -> None:
+    def write() -> None:
+        try:
+            stream.write(data)
+            stream.close()
+        except (OSError, ValueError):
+            pass
+
+    threading.Thread(target=write, daemon=True).start()
+
+
+def exit_code_of(process: subprocess.Popen) -> int:
+    return process.returncode if process.returncode is not None else -1
+
+
+def watch_process(
+    process: subprocess.Popen,
+    worker_id: str,
+    timeout: int,
+    idle_timeout: Optional[int],
+    logs: Sequence[Path],
+    state: "BatchState",
+) -> Tuple[int, Optional[str]]:
+    started = time.monotonic()
+    last_size = 0
+    last_change = last_refresh = started
+    while True:
+        remaining = timeout - (time.monotonic() - started)
+        if remaining <= 0:
+            stop_process_tree(process)
+            return exit_code_of(process), "timed_out"
+        try:
+            return process.wait(timeout=min(POLL_SECONDS, remaining)), None
+        except subprocess.TimeoutExpired:
+            pass
+        now = time.monotonic()
+        size = sum(file_bytes(path) for path in logs)
+        if size != last_size:
+            last_size, last_change = size, now
+        if idle_timeout is not None and now - last_change >= idle_timeout:
+            stop_process_tree(process)
+            return exit_code_of(process), "stalled"
+        if now - last_refresh >= STATE_REFRESH_SECONDS:
+            last_refresh = now
+            state.update_worker(worker_id, {"outputBytes": size, "idleSeconds": round(now - last_change)})
+
+
 def json_values(text: str, output_format: str) -> List[Any]:
     if not text.strip():
         return []
-    try:
-        if output_format == "json":
+    if output_format == "json":
+        try:
             return [json.loads(text)]
-        if output_format == "jsonl":
-            return [json.loads(line) for line in text.splitlines() if line.strip()]
-    except json.JSONDecodeError:
+        except json.JSONDecodeError:
+            pass
+        for line in reversed(text.splitlines()):
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    return [json.loads(line)]
+                except json.JSONDecodeError:
+                    continue
         return []
+    if output_format == "jsonl":
+        values = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                values.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        return values
     return []
 
 
@@ -1223,10 +1464,8 @@ def classify_result(
 
     if result_path.is_file():
         text = result_path.read_text(encoding="utf-8", errors="replace").strip()
-    elif output_format == "text":
-        text = stdout_text.strip()
     else:
-        text = result_text_from_values(values)
+        text = stdout_text.strip() if output_format == "text" else result_text_from_values(values)
         if text:
             result_path.write_text(text + "\n", encoding="utf-8")
 
@@ -1250,26 +1489,175 @@ def classify_result(
     return "succeeded", text, values, None
 
 
-def capture_diff(cwd: Path, worker_dir: Path, isolated: bool) -> Optional[Path]:
+def capture_diff(cwd: Path, worker_dir: Path, isolated: bool) -> Tuple[Optional[Path], Optional[str]]:
     if not in_git_worktree(cwd):
-        return None
-    if isolated:
-        untracked = run_git(cwd, ["ls-files", "--others", "--exclude-standard", "-z"])
-        paths = [
-            value.decode("utf-8", errors="surrogateescape")
-            for value in untracked.split(b"\0")
-            if value
-        ]
-        if paths:
-            run_git(cwd, ["add", "-N", "--", *paths])
-    status = run_git(cwd, ["status", "--short"])
-    (worker_dir / "status.txt").write_bytes(status)
-    patch = run_git(cwd, ["diff", "--binary", "HEAD"])
+        return None, None
+    try:
+        run_git(cwd, ["rev-parse", "--verify", "--quiet", "HEAD"], timeout=30)
+    except PlanError:
+        return None, "the repository has no commits yet, so there is no diff to capture"
+    try:
+        if isolated:
+            untracked = run_git(cwd, ["ls-files", "--others", "--exclude-standard", "-z"])
+            paths = [
+                value.decode("utf-8", errors="surrogateescape")
+                for value in untracked.split(b"\0")
+                if value
+            ]
+            if paths:
+                run_git(cwd, ["add", "-N", "--", *paths])
+        status = run_git(cwd, ["status", "--short"])
+        (worker_dir / "status.txt").write_bytes(status)
+        patch = run_git(cwd, ["diff", "--binary", "HEAD"])
+    except PlanError as error:
+        return None, str(error)
     if not patch.strip():
-        return None
+        return None, None
     diff_path = worker_dir / "diff.patch"
     diff_path.write_bytes(patch)
-    return diff_path
+    return diff_path, None
+
+
+def checkout_root(cwd: Path) -> Optional[Path]:
+    try:
+        return Path(run_git(cwd, ["rev-parse", "--show-toplevel"], timeout=30).decode().strip()).resolve()
+    except PlanError:
+        return None
+
+
+def file_fingerprint(path: Path) -> str:
+    try:
+        if path.is_symlink():
+            return "link:" + os.readlink(path)
+        if path.is_dir():
+            return "dir"
+        size = path.stat().st_size
+        if size > FINGERPRINT_MAX_BYTES:
+            return f"size:{size}:{path.stat().st_mtime_ns}"
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return "missing"
+
+
+def checkout_snapshot(root: Path, ignore: Sequence[Path] = ()) -> Optional[Dict[str, str]]:
+    try:
+        raw = run_git(root, ["status", "--porcelain=v1", "-z", "--untracked-files=all"], timeout=120)
+    except PlanError:
+        return None
+    tokens = raw.decode("utf-8", errors="surrogateescape").split("\0")
+    entries: Dict[str, str] = {}
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        index += 1
+        if len(token) < 4:
+            continue
+        code, path = token[:2], token[3:]
+        if "R" in code or "C" in code:
+            index += 1
+        absolute = root / path
+        if any(is_inside(absolute, folder) for folder in ignore):
+            continue
+        entries[path] = f"{code}:{file_fingerprint(absolute)}"
+        if len(entries) > SNAPSHOT_LIMIT:
+            return None
+    return entries
+
+
+def changed_paths(before: Dict[str, str], after: Dict[str, str]) -> List[str]:
+    return sorted(path for path in set(before) | set(after) if before.get(path) != after.get(path))
+
+
+class CheckoutRegistry:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.active: Dict[Path, Dict[str, str]] = {}
+        self.overlaps: Dict[str, Dict[str, str]] = {}
+
+    def enter(self, root: Path, worker_id: str, mode: str) -> None:
+        with self.lock:
+            active = self.active.setdefault(root, {})
+            mine = self.overlaps.setdefault(worker_id, {})
+            for other, other_mode in active.items():
+                mine[other] = other_mode
+                self.overlaps.setdefault(other, {})[worker_id] = mode
+            active[worker_id] = mode
+
+    def leave(self, root: Path, worker_id: str) -> Dict[str, str]:
+        with self.lock:
+            self.active.get(root, {}).pop(worker_id, None)
+            return dict(self.overlaps.pop(worker_id, {}))
+
+
+def parse_handoff(text: str) -> Dict[str, Optional[str]]:
+    status = verdict = summary = None
+    for match in HANDOFF_LINE.finditer(text or ""):
+        key, value = match.group(1).upper(), match.group(2).strip()
+        if key == "STATUS":
+            candidate = value.split()[0].strip(".,;:").upper()
+            status = candidate if candidate in WORKER_STATUSES else status
+        elif key == "VERDICT":
+            candidate = re.sub(r"[\s-]+", "_", value.strip(".,;: ")).upper()
+            verdict = next((option for option in VERDICTS if candidate.startswith(option)), verdict)
+        else:
+            summary = value
+    if summary and len(summary) > NOTE_LIMITS["workerWhy"]:
+        summary = summary[: NOTE_LIMITS["workerWhy"] - 3].rstrip() + "..."
+    return {"workerStatus": status, "workerSummary": summary, "verdict": verdict}
+
+
+def extract_details(values: Sequence[Any]) -> Dict[str, List[str]]:
+    denials: List[str] = []
+    billed: List[str] = []
+    for value in values:
+        if not isinstance(value, dict):
+            continue
+        raw = value.get("permission_denials")
+        if isinstance(raw, list):
+            denials = [
+                str(item.get("tool_name") or item.get("toolName") or "tool") if isinstance(item, dict) else "tool"
+                for item in raw
+            ]
+        usage = value.get("modelUsage")
+        if isinstance(usage, dict) and usage:
+            billed = sorted(str(key) for key in usage)
+    return {"permissionDenials": denials, "billedModels": billed}
+
+
+def tail_text(path: Path, lines: int = 20) -> str:
+    size = file_bytes(path)
+    if not size:
+        return ""
+    with path.open("rb") as handle:
+        handle.seek(max(0, size - 65536))
+        text = handle.read().decode("utf-8", errors="replace")
+    kept = [line for line in text.splitlines() if line.strip()]
+    return "\n".join(kept[-lines:])
+
+
+def classify_failure(
+    status: str, error: Optional[str], stderr_path: Path, result_text: str, stalled: bool
+) -> Tuple[Optional[str], Optional[str]]:
+    if status == "succeeded":
+        return None, None
+    if stalled:
+        return "stalled", None
+    if status == "timed_out":
+        return "timed_out", None
+    if str(error or "").startswith("executable not found"):
+        return "not_installed", None
+    text = "\n".join(part for part in (error or "", tail_text(stderr_path), (result_text or "")[-4000:]) if part)
+    for kind, pattern in FAILURE_PATTERNS:
+        if pattern.search(text):
+            if kind != "rate_limited":
+                return kind, None
+            reset = re.search(r"\b(?:resets?|try again|retry)\b[^\n.]{0,60}", text, re.IGNORECASE)
+            return kind, reset.group(0).strip() if reset else None
+    if "structured JSON" in str(error) or "result object" in str(error):
+        return "invalid_output", None
+    if "no final result" in str(error):
+        return "no_result", None
+    return "error", None
 
 
 class BatchState:
@@ -1313,12 +1701,45 @@ class ProcessRegistry:
             stop_process_tree(process)
 
 
+def orchestration_refusal(
+    limits: Dict[str, Any],
+    used: Dict[str, Any],
+    calls: int = 0,
+    cost: Optional[float] = None,
+    tokens: Optional[int] = None,
+) -> Optional[str]:
+    max_calls = limits.get("maxCalls")
+    if max_calls is not None and int(used.get("calls") or 0) + calls >= max_calls:
+        return f"orchestration budget maxCalls {max_calls} exhausted"
+    spent = [value for value in (number(used.get("reportedCostUsd")), cost) if value is not None]
+    max_cost = limits.get("maxReportedCostUsd")
+    if max_cost is not None and spent and sum(spent) >= max_cost:
+        return f"orchestration budget maxReportedCostUsd {max_cost} exhausted"
+    counted = [value for value in (number(used.get("reportedTokens")), tokens) if value is not None]
+    max_tokens = limits.get("maxReportedTokens")
+    if max_tokens is not None and counted and sum(counted) >= max_tokens:
+        return f"orchestration budget maxReportedTokens {max_tokens} exhausted"
+    return None
+
+
 class BudgetTracker:
     """Thread-safe batch budget. Gates are checked at worker submit time, so with
     maxConcurrent > 1 they are approximate: already-running workers finish."""
 
-    def __init__(self, budget: Dict[str, Any]) -> None:
+    def __init__(
+        self,
+        budget: Dict[str, Any],
+        outer: Optional[Dict[str, Any]] = None,
+        max_concurrent: int = 1,
+        workers: int = 1,
+    ) -> None:
         self.budget = budget
+        self.outer_limits: Dict[str, Any] = (outer or {}).get("limits", {})
+        self.outer_used: Dict[str, Any] = (outer or {}).get("used", {})
+        self.max_concurrent = max_concurrent
+        self.workers = workers
+        self.finished: set = set()
+        self.reserved: Dict[str, float] = {}
         self.lock = threading.Lock()
         self.calls = 0
         self.started_clock = time.monotonic()
@@ -1333,22 +1754,61 @@ class BudgetTracker:
             return None
         return limit - (time.monotonic() - self.started_clock)
 
-    def admit(self) -> Optional[str]:
-        with self.lock:
-            max_calls = self.budget.get("maxCalls")
-            if max_calls is not None and self.calls >= max_calls:
-                return f"budget maxCalls {max_calls} exhausted"
-            max_wall = self.budget.get("maxWallSeconds")
-            if max_wall is not None and time.monotonic() - self.started_clock >= max_wall:
-                return f"budget maxWallSeconds {max_wall} exhausted"
-            max_cost = self.budget.get("maxReportedCostUsd")
-            if max_cost is not None and self.cost_seen and self.reported_cost >= max_cost:
-                return f"budget maxReportedCostUsd {max_cost} exhausted"
-            self.calls += 1
-            return None
+    def remaining_cost(self) -> Optional[float]:
+        limits = []
+        plan_limit = self.budget.get("maxReportedCostUsd")
+        if plan_limit is not None:
+            limits.append(plan_limit - self.reported_cost)
+        outer_limit = self.outer_limits.get("maxReportedCostUsd")
+        if outer_limit is not None:
+            limits.append(outer_limit - (number(self.outer_used.get("reportedCostUsd")) or 0) - self.reported_cost)
+        return min(limits) if limits else None
 
-    def record(self, metrics: Dict[str, Any]) -> None:
+    def refusal(self) -> Optional[str]:
+        max_calls = self.budget.get("maxCalls")
+        if max_calls is not None and self.calls >= max_calls:
+            return f"budget maxCalls {max_calls} exhausted"
+        max_wall = self.budget.get("maxWallSeconds")
+        if max_wall is not None and time.monotonic() - self.started_clock >= max_wall:
+            return f"budget maxWallSeconds {max_wall} exhausted"
+        max_cost = self.budget.get("maxReportedCostUsd")
+        if max_cost is not None and self.cost_seen and self.reported_cost >= max_cost:
+            return f"budget maxReportedCostUsd {max_cost} exhausted"
+        max_tokens = self.budget.get("maxReportedTokens")
+        if max_tokens is not None and self.tokens_seen and self.reported_tokens >= max_tokens:
+            return f"budget maxReportedTokens {max_tokens} exhausted"
+        return orchestration_refusal(
+            self.outer_limits,
+            self.outer_used,
+            self.calls,
+            self.reported_cost if self.cost_seen else None,
+            self.reported_tokens if self.tokens_seen else None,
+        )
+
+    def admit(self, worker_id: str, wants_cost_cap: bool = False) -> Tuple[Optional[str], Optional[float]]:
         with self.lock:
+            refusal = self.refusal()
+            if refusal is not None:
+                return refusal, None
+            cap = None
+            remaining = self.remaining_cost() if wants_cost_cap else None
+            if remaining is not None:
+                free = remaining - sum(self.reserved.values())
+                pending = self.workers - len(self.finished)
+                slots = max(1, min(self.max_concurrent, pending) - len(self.reserved))
+                cap = math.floor(max(0.0, free) / slots * 100) / 100
+                if cap < 0.01:
+                    return "budget maxReportedCostUsd leaves less than $0.01 for this worker", None
+                self.reserved[worker_id] = cap
+            self.calls += 1
+            return None, cap
+
+    def finish(self, worker_id: str, metrics: Dict[str, Any]) -> None:
+        with self.lock:
+            if worker_id in self.finished:
+                return
+            self.finished.add(worker_id)
+            self.reserved.pop(worker_id, None)
             cost = metrics.get("totalCostUsd")
             if isinstance(cost, (int, float)) and not isinstance(cost, bool):
                 self.cost_seen = True
@@ -1377,6 +1837,7 @@ def run_worker(
     help_lock: threading.Lock,
     registry: ProcessRegistry,
     tracker: BudgetTracker,
+    checkouts: CheckoutRegistry,
 ) -> Dict[str, Any]:
     worker_id = worker["id"]
     worker_dir = run_dir / "workers" / worker_id
@@ -1386,128 +1847,303 @@ def run_worker(
     stderr_path = worker_dir / "stderr.log"
     outcome_path = worker_dir / "outcome.json"
     prompt_path.write_text(worker["task"], encoding="utf-8")
-    started_at = now_iso()
     started_clock = time.monotonic()
-    process: Optional[subprocess.Popen] = None
-    timed_out = False
-    exit_code = -1
+    outcome: Dict[str, Any] = {
+        "id": worker_id,
+        "provider": worker["provider"],
+        "status": "failed",
+        "exitCode": None,
+        "timedOut": False,
+        "startedAt": now_iso(),
+        "finishedAt": None,
+        "durationSeconds": 0.0,
+        "cwd": worker["cwd"],
+        "worktree": None,
+        "resultPath": None,
+        "stdoutPath": None,
+        "stderrPath": None,
+        "diffPath": None,
+        "diffError": None,
+        "sessionId": None,
+        "metrics": {},
+        "costCapUsd": None,
+        "error": None,
+        "failureKind": None,
+        "resetHint": None,
+        "workerStatus": None,
+        "workerSummary": None,
+        "verdict": None,
+        "permissionDenials": [],
+        "billedModels": [],
+        "readOnlyViolation": None,
+        "touchedFiles": None,
+        "dirtyBefore": None,
+        "sharedCheckoutWith": [],
+    }
 
-    refusal = tracker.admit()
-    if refusal is not None:
-        outcome = {
-            "id": worker_id,
-            "provider": worker["provider"],
-            "status": "skipped",
-            "exitCode": None,
-            "timedOut": False,
-            "startedAt": started_at,
-            "finishedAt": now_iso(),
-            "durationSeconds": 0.0,
-            "cwd": worker["cwd"],
-            "worktree": None,
-            "resultPath": None,
-            "stdoutPath": None,
-            "stderrPath": None,
-            "diffPath": None,
-            "sessionId": None,
-            "metrics": {},
-            "error": refusal,
-        }
+    def settle(**fields: Any) -> Dict[str, Any]:
+        outcome.update(fields)
+        outcome["finishedAt"] = now_iso()
+        outcome["durationSeconds"] = round(time.monotonic() - started_clock, 3)
         atomic_write_json(outcome_path, outcome)
         state.update_worker(worker_id, outcome)
         return outcome
 
+    refusal, cost_cap = tracker.admit(worker_id, worker["provider"] == "claude")
+    if refusal is not None:
+        tracker.finish(worker_id, {})
+        return settle(status="skipped", error=refusal, failureKind="budget")
+
+    process: Optional[subprocess.Popen] = None
+    root: Optional[Path] = None
+    metrics: Dict[str, Any] = {}
     try:
         cwd = prepare_worktree(worker, run_id) if worker["isolate"] else Path(worker["cwd"])
+        outcome.update(cwd=str(cwd), worktree=str(cwd) if worker["isolate"] else None, costCapUsd=cost_cap)
         timeout = worker["timeoutSeconds"]
         remaining_wall = tracker.remaining_wall()
         if remaining_wall is not None:
             timeout = max(1, int(min(timeout, remaining_wall)))
         args, stdin_prompt, output_format, result_path = build_invocation(
-            worker, cwd, worker_dir, help_cache, help_lock, timeout
+            worker, cwd, worker_dir, help_cache, help_lock, timeout, cost_cap
         )
+        before = None
+        if not worker["isolate"]:
+            root = checkout_root(cwd)
+            if root is not None:
+                checkouts.enter(root, worker_id, worker["mode"])
+                before = checkout_snapshot(root, ignore=[run_dir])
         state.update_worker(
             worker_id,
             {
                 "status": "running",
-                "startedAt": started_at,
+                "startedAt": outcome["startedAt"],
                 "cwd": str(cwd),
-                "worktree": str(cwd) if worker["isolate"] else None,
+                "worktree": outcome["worktree"],
+                "costCapUsd": cost_cap,
             },
         )
         with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
             stdin_mode = subprocess.PIPE if stdin_prompt else subprocess.DEVNULL
-            process = start_process(args, cwd, stdin_mode, stdout_file, stderr_file)
+            process = start_process(args, cwd, stdin_mode, stdout_file, stderr_file, worker_environment())
             registry.add(process)
             if stdin_prompt and process.stdin is not None:
-                process.stdin.write(worker["task"].encode("utf-8"))
-                process.stdin.close()
-            try:
-                exit_code = process.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                stop_process_tree(process)
-                exit_code = process.returncode if process.returncode is not None else -1
+                feed_stdin(process.stdin, worker["task"].encode("utf-8"))
+            exit_code, ended = watch_process(
+                process, worker_id, timeout, worker["idleTimeoutSeconds"], (stdout_path, stderr_path), state
+            )
             registry.remove(process)
-
+        overlapped = checkouts.leave(root, worker_id) if root is not None else {}
         status, result_text, values, error = classify_result(
-            worker["provider"], output_format, stdout_path, result_path, exit_code, timed_out
+            worker["provider"], output_format, stdout_path, result_path, exit_code, ended is not None
         )
+        if ended == "stalled":
+            error = f"worker printed nothing for {worker['idleTimeoutSeconds']}s"
         metrics = extract_metrics(values)
-        tracker.record(metrics)
-        diff_path = (
-            capture_diff(cwd, worker_dir, worker["isolate"])
-            if worker["mode"] == "write"
-            else None
+        details = extract_details(values)
+        handoff = parse_handoff(result_text)
+        kind, reset_hint = classify_failure(status, error, stderr_path, result_text, ended == "stalled")
+        diff_path, diff_error = (
+            capture_diff(cwd, worker_dir, worker["isolate"]) if worker["mode"] == "write" else (None, None)
         )
-        outcome = {
-            "id": worker_id,
-            "provider": worker["provider"],
-            "status": status,
-            "exitCode": exit_code,
-            "timedOut": timed_out,
-            "startedAt": started_at,
-            "finishedAt": now_iso(),
-            "durationSeconds": round(time.monotonic() - started_clock, 3),
-            "cwd": str(cwd),
-            "worktree": str(cwd) if worker["isolate"] else None,
-            "resultPath": str(result_path),
-            "stdoutPath": str(stdout_path),
-            "stderrPath": str(stderr_path),
-            "diffPath": str(diff_path) if diff_path else None,
-            "sessionId": extract_session(values),
-            "metrics": metrics,
-            "error": error,
-        }
-        atomic_write_json(outcome_path, outcome)
-        state.update_worker(worker_id, outcome)
-        return outcome
+        touched = dirty_before = violation = None
+        writer_nearby = any(mode == "write" for mode in overlapped.values())
+        if before is not None and root is not None and not writer_nearby:
+            after = checkout_snapshot(root, ignore=[run_dir])
+            if after is not None:
+                touched = changed_paths(before, after)[:MAX_LISTED_PATHS]
+                if worker["mode"] == "read-only":
+                    violation = bool(touched)
+                else:
+                    dirty_before = sorted(before)[:MAX_LISTED_PATHS]
+        tracker.finish(worker_id, metrics)
+        return settle(
+            status=status,
+            exitCode=exit_code,
+            timedOut=ended is not None,
+            resultPath=str(result_path),
+            stdoutPath=str(stdout_path),
+            stderrPath=str(stderr_path),
+            diffPath=str(diff_path) if diff_path else None,
+            diffError=diff_error,
+            sessionId=extract_session(values),
+            metrics=metrics,
+            error=error,
+            failureKind=kind,
+            resetHint=reset_hint,
+            readOnlyViolation=violation,
+            touchedFiles=touched,
+            dirtyBefore=dirty_before,
+            sharedCheckoutWith=sorted(overlapped),
+            **handoff,
+            **details,
+        )
     except Exception as error:  # Every worker failure must settle the batch state.
         if process is not None:
             stop_process_tree(process)
             registry.remove(process)
-        outcome = {
-            "id": worker_id,
-            "provider": worker["provider"],
-            "status": "failed",
-            "exitCode": exit_code,
-            "timedOut": timed_out,
-            "startedAt": started_at,
-            "finishedAt": now_iso(),
-            "durationSeconds": round(time.monotonic() - started_clock, 3),
-            "cwd": worker["cwd"],
-            "worktree": None,
-            "resultPath": None,
-            "stdoutPath": str(stdout_path),
-            "stderrPath": str(stderr_path),
-            "diffPath": None,
-            "sessionId": None,
-            "metrics": {},
-            "error": str(error),
-        }
-        atomic_write_json(outcome_path, outcome)
-        state.update_worker(worker_id, outcome)
-        return outcome
+        if root is not None:
+            checkouts.leave(root, worker_id)
+        tracker.finish(worker_id, metrics)
+        message = str(error)
+        return settle(
+            status="failed",
+            error=message,
+            failureKind="not_installed" if message.startswith("executable not found") else "error",
+            stdoutPath=str(stdout_path),
+            stderrPath=str(stderr_path),
+        )
+
+
+def validate_orchestration_limits(raw: Any, label: str) -> Dict[str, Any]:
+    limits = validate_budget(raw, label)
+    extra = set(limits) - set(ORCHESTRATION_BUDGET_FIELDS)
+    if extra:
+        raise PlanError(
+            f"{label} only takes {', '.join(ORCHESTRATION_BUDGET_FIELDS)}, not {', '.join(sorted(extra))}"
+        )
+    return limits
+
+
+def load_orchestration_budget(folder: Path) -> Dict[str, Any]:
+    path = folder / ORCHESTRATION_BUDGET_FILE
+    if not path.is_file():
+        return {}
+    raw = read_json(path)
+    if not isinstance(raw, dict) or raw.get("version") != 1:
+        raise PlanError(f"{path} must be an object with version 1")
+    return validate_orchestration_limits(raw.get("limits"), f"{path.name} limits")
+
+
+def orchestration_usage(folder: Path, exclude: Optional[Path] = None) -> Dict[str, Any]:
+    calls, runs = 0, 0
+    cost: Optional[float] = None
+    tokens: Optional[int] = None
+    if not folder.is_dir():
+        return {"runs": 0, "calls": 0, "reportedCostUsd": None, "reportedTokens": None}
+    for child in sorted(folder.iterdir()):
+        if exclude is not None and child.resolve() == exclude.resolve():
+            continue
+        state = read_optional_json(child / "state.json")
+        if not isinstance(state, dict):
+            continue
+        runs += 1
+        usage = state.get("budgetUsage") if isinstance(state.get("budgetUsage"), dict) else {}
+        calls += int(number(usage.get("calls")) or 0)
+        spent = number(usage.get("reportedCostUsd"))
+        if spent is not None:
+            cost = (cost or 0.0) + spent
+        reported = number(usage.get("reportedTokens"))
+        if reported is not None:
+            tokens = (tokens or 0) + int(reported)
+    return {
+        "runs": runs,
+        "calls": calls,
+        "reportedCostUsd": round(cost, 6) if cost is not None else None,
+        "reportedTokens": tokens,
+    }
+
+
+def budget_payload(folder: Path, updates: Dict[str, Any], clear: bool) -> Dict[str, Any]:
+    folder = folder.expanduser().resolve()
+    path = folder / ORCHESTRATION_BUDGET_FILE
+    if clear:
+        if path.exists():
+            path.unlink()
+        limits: Dict[str, Any] = {}
+    else:
+        limits = load_orchestration_budget(folder)
+        if updates:
+            limits = validate_orchestration_limits({**limits, **updates}, "budget")
+            folder.mkdir(parents=True, exist_ok=True)
+            atomic_write_json(path, {"version": 1, "limits": limits, "updatedAt": now_iso()})
+    used = orchestration_usage(folder)
+    remaining: Dict[str, Any] = {}
+    if "maxCalls" in limits:
+        remaining["calls"] = max(0, limits["maxCalls"] - used["calls"])
+    if "maxReportedCostUsd" in limits:
+        remaining["reportedCostUsd"] = round(max(0.0, limits["maxReportedCostUsd"] - (used["reportedCostUsd"] or 0)), 6)
+    if "maxReportedTokens" in limits:
+        remaining["reportedTokens"] = max(0, limits["maxReportedTokens"] - (used["reportedTokens"] or 0))
+    return {
+        "path": str(path),
+        "limits": limits,
+        "used": used,
+        "remaining": remaining,
+        "note": "Reported cost covers only CLIs that report it; token and call limits cover the rest.",
+    }
+
+
+def mark_payload(run_dir: Path, worker_id: str, mark: str, why: Optional[str]) -> Dict[str, Any]:
+    run_dir = run_dir.expanduser().resolve()
+    state = read_json(run_dir / "state.json")
+    if not isinstance(state, dict) or worker_id not in state.get("workers", {}):
+        raise PlanError(f"{run_dir} has no worker {worker_id}")
+    entry = {
+        "worker": worker_id,
+        "mark": mark,
+        "why": optional_note(why, "mark why", NOTE_LIMITS["workerWhy"]),
+        "markedAt": now_iso(),
+    }
+    atomic_write_json(run_dir / "workers" / worker_id / "mark.json", entry)
+    return entry
+
+
+def task_text(worker: Dict[str, Any]) -> str:
+    return worker["task"].split("\n\nRuntime contract:", 1)[0]
+
+
+def dirty_checkout(cwd: str) -> bool:
+    try:
+        return bool(run_git(Path(cwd), ["status", "--porcelain"], timeout=60).strip())
+    except PlanError:
+        return False
+
+
+def plan_warnings(plan: Dict[str, Any]) -> List[str]:
+    workers = plan["workers"]
+    warnings: List[str] = []
+    blind = []
+    for worker in workers:
+        label = Path(worker["command"]).stem if worker["provider"] == "custom" else worker["provider"]
+        if worker["provider"] not in COST_REPORTING_PROVIDERS and label not in blind:
+            blind.append(label)
+    if "maxReportedCostUsd" in plan["budget"] and blind:
+        warnings.append(
+            f"maxReportedCostUsd only sees cost that Claude reports; {listed(blind)} "
+            f"{'report' if len(blind) > 1 else 'reports'} none, so cap {'them' if len(blind) > 1 else 'it'} "
+            "with maxReportedTokens or maxCalls"
+        )
+    writers = [worker for worker in workers if worker["mode"] == "write"]
+    small = [worker for worker in writers if len(task_text(worker).split()) <= 50]
+    if len(writers) >= 2 and len(small) == len(writers):
+        warnings.append(
+            f"{len(writers)} writers with short briefs: each worker first loads its own CLI context, "
+            "so these may cost less done directly or as one worker"
+        )
+    for worker in workers:
+        name = worker["id"]
+        if worker["provider"] != "custom" and not (worker["model"] or worker["effort"]):
+            warnings.append(f"{name} runs on {worker['provider']}'s default model; pin a tier, model or effort")
+        if worker["provider"] == "kimi" and worker["mode"] == "read-only":
+            warnings.append(
+                f"{name}: Kimi runs prompts with every permission, so read-only rests on the worker contract; "
+                "the runner checks the checkout afterwards"
+            )
+        if worker["provider"] == "kimi" and worker["mode"] == "write" and not worker["isolate"]:
+            warnings.append(f"{name}: Kimi writes without asking; give it isolate: true")
+        if (
+            worker["provider"] in ("codex", "claude")
+            and not worker["mcp"]
+            and re.search(r"\bmcp\b", task_text(worker), re.IGNORECASE)
+        ):
+            warnings.append(f"{name} mentions MCP, but workers start without MCP servers; set mcp: true if it needs one")
+        if worker["mode"] == "write" and not worker["isolate"] and dirty_checkout(worker["cwd"]):
+            warnings.append(
+                f"{name} writes in a checkout with uncommitted changes, so its diff will include them; "
+                "use isolate: true or commit first"
+            )
+    return warnings
 
 
 def default_run_dir() -> Path:
@@ -1522,12 +2158,27 @@ def run_batch(
     policy_path: Path,
     strategy_override: Optional[str],
 ) -> int:
+    if os.environ.get(WORKER_ENV_FLAG):
+        raise PlanError("this process is an orchestration worker, and workers cannot start orchestrations")
     plan = validate_plan(
         read_json(plan_path), plan_path.resolve(), load_policy(policy_path), strategy_override
     )
     run_dir = (requested_run_dir or default_run_dir()).expanduser().resolve()
     if run_dir.exists() and any(run_dir.iterdir()):
         raise PlanError(f"run directory is not empty: {run_dir}")
+    outer = None
+    if requested_run_dir is not None:
+        limits = load_orchestration_budget(run_dir.parent)
+        if limits:
+            used = orchestration_usage(run_dir.parent, exclude=run_dir)
+            refusal = orchestration_refusal(limits, used)
+            if refusal:
+                raise PlanError(f"{refusal}; raise it with budget {run_dir.parent}")
+            outer = {
+                "path": str(run_dir.parent / ORCHESTRATION_BUDGET_FILE),
+                "limits": limits,
+                "used": used,
+            }
     run_dir.mkdir(parents=True, exist_ok=True)
     atomic_write_json(
         run_dir / "plan.json", plan_payload(plan, plan_path.resolve(), policy_path, dry_run=False)
@@ -1559,13 +2210,15 @@ def run_batch(
             "startedAt": now_iso(),
             "finishedAt": None,
             "budget": plan["budget"],
+            "orchestrationBudget": outer,
             "workers": initial_workers,
         },
     )
     help_cache: Dict[str, str] = {}
     help_lock = threading.Lock()
     registry = ProcessRegistry()
-    tracker = BudgetTracker(plan["budget"])
+    checkouts = CheckoutRegistry()
+    tracker = BudgetTracker(plan["budget"], outer, plan["maxConcurrent"], len(plan["workers"]))
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=plan["maxConcurrent"])
     futures: List[concurrent.futures.Future] = []
     try:
@@ -1580,6 +2233,7 @@ def run_batch(
                 help_lock,
                 registry,
                 tracker,
+                checkouts,
             )
             for worker in plan["workers"]
         ]
@@ -1657,6 +2311,11 @@ def plan_payload(
                 "effectiveTimeoutSeconds": effective_timeout,
                 "promptChars": len(worker["task"]),
                 "estimatedPromptTokens": worker["estimatedPromptTokens"],
+                "subagents": "blocked by the CLI"
+                if worker["provider"] in ("codex", "claude")
+                else "refused by the worker contract",
+                "mcp": worker["mcp"] if worker["provider"] in ("codex", "claude") else None,
+                "idleTimeoutSeconds": worker["idleTimeoutSeconds"],
                 "telemetry": {
                     "tokenUsage": PROVIDER_CAPABILITIES.get(worker["provider"], {}).get(
                         "tokenUsage", False
@@ -1687,6 +2346,7 @@ def plan_payload(
             "prompt-only chars/4 heuristic; provider-side context such as repository reads "
             "and tool calls is additional and cannot be estimated"
         ),
+        "warnings": plan_warnings(plan),
     }
 
 
@@ -1765,7 +2425,7 @@ def result_summary(path: Path, limit: int = 200) -> Optional[str]:
     first = None
     for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
         line = re.sub(r"^(?:[-*+>]|\d+[.)])\s+", "", raw.strip()).replace("**", "").strip()
-        if not line or line.startswith(("#", "|", "```")) or set(line) <= set("-*_=| "):
+        if not line or line.startswith(("#", "|", "```")) or set(line) <= set("-*_=| ") or HANDOFF_LINE.match(line):
             continue
         first = first or line
         if len(line.split()) >= 3 or re.search(r"[.!?]$", line):
@@ -1786,7 +2446,9 @@ def last_line(path: Path, limit: int = 200) -> Optional[str]:
     lines = [line.strip() for line in tail.splitlines() if line.strip()]
     if not lines:
         return None
-    return lines[-1] if len(lines[-1]) <= limit else lines[-1][: limit - 3].rstrip() + "..."
+    errors = [line for line in lines[-20:] if ERROR_LINE.search(line)]
+    line = errors[-1] if errors else lines[-1]
+    return line if len(line) <= limit else line[: limit - 3].rstrip() + "..."
 
 
 def seconds_between(started: Any, finished: Any) -> Optional[float]:
@@ -1819,6 +2481,11 @@ def collect_run(run_dir: Path) -> Dict[str, Any]:
         diff_path = worker_dir / "diff.patch"
         provider = outcome.get("provider") or entry.get("provider")
         status = outcome.get("status", "unknown")
+        handoff = {key: outcome.get(key) for key in ("workerStatus", "workerSummary", "verdict")}
+        if not any(handoff.values()) and result_path.is_file():
+            handoff = parse_handoff(result_path.read_text(encoding="utf-8", errors="replace"))
+        mark = read_optional_json(worker_dir / "mark.json")
+        mark = mark if isinstance(mark, dict) and mark.get("mark") in MARKS else {}
         workers.append(
             {
                 "id": worker_id,
@@ -1842,7 +2509,20 @@ def collect_run(run_dir: Path) -> Dict[str, Any]:
                 "costUsd": number(metrics.get("totalCostUsd")),
                 "sessionId": outcome.get("sessionId"),
                 "worktree": outcome.get("worktree"),
-                "summary": result_summary(result_path),
+                "summary": handoff["workerSummary"] or result_summary(result_path),
+                "workerStatus": handoff["workerStatus"],
+                "verdict": handoff["verdict"],
+                "failureKind": outcome.get("failureKind"),
+                "resetHint": outcome.get("resetHint"),
+                "permissionDenials": list(outcome.get("permissionDenials") or []),
+                "billedModels": list(outcome.get("billedModels") or []),
+                "readOnlyViolation": outcome.get("readOnlyViolation"),
+                "touchedFiles": outcome.get("touchedFiles"),
+                "dirtyBefore": outcome.get("dirtyBefore"),
+                "costCapUsd": number(outcome.get("costCapUsd")),
+                "diffError": outcome.get("diffError"),
+                "mark": mark.get("mark"),
+                "markWhy": mark.get("why"),
                 "resultPath": str(result_path) if result_path.is_file() else None,
                 "resultBytes": file_bytes(result_path),
                 "transcriptBytes": file_bytes(worker_dir / "stdout.log") + file_bytes(stderr_path),
@@ -1874,6 +2554,60 @@ def collect_run(run_dir: Path) -> Dict[str, Any]:
         "budgetUsage": usage,
         "workers": workers,
     }
+
+
+def concerns(worker: Dict[str, Any]) -> List[str]:
+    reasons = []
+    said = worker["workerStatus"]
+    if said in ("BLOCKED", "NEEDS_CONTEXT"):
+        reasons.append(
+            f"it said {said.replace('_', ' ').lower()}; change its context, tier or scope before sending it again"
+        )
+    elif said == "DONE_WITH_CONCERNS":
+        reasons.append("it finished with concerns to review")
+    if worker["verdict"] in ("FAIL", "NOT_PROVEN"):
+        reasons.append(f"its verdict is {worker['verdict'].replace('_', ' ').lower()}")
+    if worker["readOnlyViolation"]:
+        touched = list(worker["touchedFiles"] or [])[:5]
+        reasons.append(f"it changed the checkout while read-only ({listed(touched)})")
+    denials = worker["permissionDenials"]
+    if denials:
+        reasons.append(
+            f"{counted(len(denials), 'tool call')} denied ({listed(sorted(set(denials)))}), so its checks may not have run"
+        )
+    return reasons
+
+
+def value_totals(workers: Sequence[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not any(worker["mark"] for worker in workers):
+        return None
+    groups: Dict[str, Any] = {}
+    for key in (*MARKS, "unmarked"):
+        members = [
+            worker
+            for worker in workers
+            if (worker["mark"] or "unmarked") == key and (key != "unmarked" or worker["status"] in RAN_STATUSES)
+        ]
+        groups[key] = {
+            "workers": [worker["id"] for worker in members],
+            "tokens": summed([worker["tokens"] for worker in members]),
+            "costUsd": summed([worker["costUsd"] for worker in members]),
+        }
+    return groups
+
+
+def report_budget(runs: Sequence[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    folders = {Path(run["runDir"]).parent for run in runs}
+    if len(folders) != 1:
+        return None
+    folder = folders.pop()
+    try:
+        limits = load_orchestration_budget(folder)
+    except PlanError:
+        return None
+    if not limits:
+        return None
+    return {"path": str(folder / ORCHESTRATION_BUDGET_FILE), "limits": limits, "used": orchestration_usage(folder)}
 
 
 def summed(values: Sequence[Any]) -> Optional[float]:
@@ -1912,7 +2646,12 @@ def build_report(run_dirs: Sequence[Path]) -> Dict[str, Any]:
         return sorted({w["label"] for w in ran if w["label"] not in reporting})
 
     changed = [worker for worker in workers if worker["diff"]]
-    attention = [worker for worker in workers if worker["status"] != "succeeded"]
+    attention = [worker for worker in workers if worker["status"] != "succeeded" or concerns(worker)]
+    said: Dict[str, int] = {}
+    for worker in workers:
+        if worker["status"] in RAN_STATUSES:
+            key = worker["workerStatus"] or "unreported"
+            said[key] = said.get(key, 0) + 1
     titles = [run["title"] for run in runs if run["title"]]
     playbooks: List[str] = []
     for run in runs:
@@ -1932,6 +2671,8 @@ def build_report(run_dirs: Sequence[Path]) -> Dict[str, Any]:
             "statuses": statuses,
             "wallSeconds": summed([run["wallSeconds"] for run in runs]),
             "workerSeconds": summed([worker["durationSeconds"] for worker in workers]),
+            "calls": int(sum(number(run["budgetUsage"].get("calls")) or 0 for run in runs)),
+            "workerStatuses": said,
             "tokens": summed([worker["tokens"] for worker in workers]),
             "cachedTokens": summed([worker["cachedTokens"] for worker in workers]),
             "tokensNotReportedBy": silent("tokens"),
@@ -1949,9 +2690,12 @@ def build_report(run_dirs: Sequence[Path]) -> Dict[str, Any]:
             "budgetStops": [
                 worker["error"]
                 for worker in workers
-                if worker["status"] == "skipped" and str(worker["error"] or "").startswith("budget")
+                if worker["status"] == "skipped"
+                and str(worker["error"] or "").startswith(("budget", "orchestration budget"))
             ],
+            "value": value_totals(workers),
         },
+        "orchestrationBudget": report_budget(runs),
         "byProvider": by_provider,
         "runs": runs,
         "followUps": {
@@ -1970,6 +2714,10 @@ def build_report(run_dirs: Sequence[Path]) -> Dict[str, Any]:
                     "worker": w["id"],
                     "status": w["status"],
                     "error": w["error"],
+                    "reasons": concerns(w),
+                    "failureKind": w["failureKind"],
+                    "hint": FAILURE_HINTS.get(w["failureKind"] or ""),
+                    "resetHint": w["resetHint"],
                     "stderrTail": w["stderrTail"],
                     "stderrPath": w["stderrPath"],
                     "provider": w["provider"],
@@ -2049,10 +2797,64 @@ def ran_on(worker: Dict[str, Any]) -> str:
     if requested and requested not in ("auto", provider):
         head = f"{requested} -> {head}"
     parts = [head]
-    if worker["model"] or provider != "custom":
-        parts.append(worker["model"] or "default model")
+    if worker["model"]:
+        parts.append(worker["model"])
+    elif worker["billedModels"]:
+        parts.append(", ".join(worker["billedModels"]))
+    elif provider != "custom":
+        parts.append("default model")
     if worker["effort"]:
         parts.append(worker["effort"])
+    return ", ".join(parts)
+
+
+def status_text(worker: Dict[str, Any]) -> str:
+    parts = [worker["status"].replace("_", " ")]
+    if worker["workerStatus"] and worker["workerStatus"] != "DONE":
+        parts.append(worker["workerStatus"].replace("_", " ").lower())
+    if worker["verdict"]:
+        parts.append(worker["verdict"].replace("_", " ").lower())
+    if worker["readOnlyViolation"]:
+        parts.append("wrote while read-only")
+    return ", ".join(parts)
+
+
+def spend_text(tokens: Optional[float], cost: Optional[float]) -> str:
+    parts = [human_cost(cost) if cost is not None else "no cost reported"]
+    parts.append(f"{human_count(tokens)} tokens" if tokens is not None else "no tokens reported")
+    return ", ".join(parts)
+
+
+def value_text(value: Dict[str, Any]) -> str:
+    labels = {"used": "used", "partial": "partly used", "discarded": "discarded"}
+    parts = []
+    for key, label in labels.items():
+        group = value[key]
+        if group["workers"]:
+            parts.append(f"{counted(len(group['workers']), 'result')} {label} ({spend_text(group['tokens'], group['costUsd'])})")
+    text = "; ".join(parts) or "nothing marked yet"
+    unmarked = value["unmarked"]["workers"]
+    if unmarked:
+        text += f"; {counted(len(unmarked), 'result')} not marked"
+    return text
+
+
+def limits_text(limits: Dict[str, Any], calls: Any, cost: Any, tokens: Any) -> str:
+    parts = []
+    if "maxCalls" in limits:
+        parts.append(f"{int(number(calls) or 0)} of {limits['maxCalls']} calls")
+    if "maxReportedCostUsd" in limits:
+        spent = number(cost)
+        limit = human_cost(limits["maxReportedCostUsd"])
+        parts.append(f"{human_cost(spent)} of {limit}" if spent is not None else f"no cost reported against {limit}")
+    if "maxReportedTokens" in limits:
+        counted_tokens = number(tokens)
+        limit = human_count(limits["maxReportedTokens"])
+        parts.append(
+            f"{human_count(counted_tokens)} of {limit} reported tokens"
+            if counted_tokens is not None
+            else f"no tokens reported against {limit}"
+        )
     return ", ".join(parts)
 
 
@@ -2069,12 +2871,9 @@ def mode_text(worker: Dict[str, Any]) -> str:
 def budget_text(run: Dict[str, Any]) -> Optional[str]:
     budget, usage = run["budget"], run["budgetUsage"]
     parts = []
-    if "maxCalls" in budget:
-        parts.append(f"{usage.get('calls', '?')} of {budget['maxCalls']} calls")
-    if "maxReportedCostUsd" in budget:
-        parts.append(
-            f"{human_cost(number(usage.get('reportedCostUsd')) or 0)} of {human_cost(budget['maxReportedCostUsd'])}"
-        )
+    text = limits_text(budget, usage.get("calls"), usage.get("reportedCostUsd"), usage.get("reportedTokens"))
+    if text:
+        parts.append(text)
     if "maxWallSeconds" in budget:
         parts.append(f"{human_seconds(run['wallSeconds'])} of {human_seconds(budget['maxWallSeconds'])}")
     if "maxEstimatedPromptTokens" in budget:
@@ -2142,6 +2941,13 @@ def render_markdown(report: Dict[str, Any]) -> str:
     if totals["budgetStops"]:
         stops = sorted(set(totals["budgetStops"]))
         lines.append(f"- **Budget:** stopped {counted(len(totals['budgetStops']), 'worker')} ({'; '.join(stops)})")
+    outer = report["orchestrationBudget"]
+    if outer:
+        used = outer["used"]
+        spent = limits_text(outer["limits"], used["calls"], used["reportedCostUsd"], used["reportedTokens"])
+        lines.append(f"- **Orchestration budget:** {spent}")
+    if totals["value"]:
+        lines.append(f"- **Value:** {value_text(totals['value'])}")
 
     for index, run in enumerate(runs, 1):
         name = run["phase"] or f"Wave {index}"
@@ -2176,7 +2982,7 @@ def render_markdown(report: Dict[str, Any]) -> str:
             row += [
                 cell(ran_on(worker)),
                 mode_text(worker),
-                worker["status"].replace("_", " "),
+                status_text(worker),
                 human_seconds(worker["durationSeconds"]),
                 human_count(worker["tokens"]),
                 human_cost(worker["costUsd"]),
@@ -2194,6 +3000,20 @@ def render_markdown(report: Dict[str, Any]) -> str:
                 detail.append(f"{worker['status'].replace('_', ' ').capitalize()}: {reason}.")
             if worker["diff"]:
                 detail.append(f"Changed {change_text(worker['diff'])}.")
+            if worker["dirtyBefore"]:
+                detail.append(
+                    f"{counted(len(worker['dirtyBefore']), 'file')} in its diff already had uncommitted changes."
+                )
+            if worker["diffError"]:
+                detail.append(f"No diff: {cell(worker['diffError'])}.")
+            if worker["readOnlyViolation"]:
+                detail.append(f"Changed while read-only: {cell(listed(list(worker['touchedFiles'] or [])[:5]))}.")
+            if worker["permissionDenials"]:
+                denied = listed(sorted(set(worker["permissionDenials"])))
+                detail.append(f"Denied {counted(len(worker['permissionDenials']), 'tool call')} ({cell(denied)}).")
+            if worker["mark"]:
+                marked = f"Marked {worker['mark']}"
+                detail.append(marked + (f": {cell(worker['markWhy'])}." if worker["markWhy"] else "."))
             notes = [note for note in (worker["modelNote"], worker["routingNote"]) if note]
             text = " ".join(detail) or "No result."
             if notes:
@@ -2214,7 +3034,13 @@ def render_markdown(report: Dict[str, Any]) -> str:
         text = f"- `{item['worker']}` {item['status'].replace('_', ' ')}"
         if item["error"]:
             text += f": {cell(item['error'])}"
-        if item["stderrPath"]:
+        if item["reasons"]:
+            text += ("; " if item["error"] else ": ") + "; ".join(item["reasons"])
+        if item["hint"]:
+            text += f". {item['hint'][0].upper()}{item['hint'][1:]}"
+        if item["resetHint"]:
+            text += f" ({cell(item['resetHint'])})"
+        if item["stderrPath"] and item["status"] != "succeeded":
             text += f". Logs: `{item['stderrPath']}`"
         if item["resume"]:
             text += f". Resume {item['provider']} session `{item['resume']}` with the rescue strategy"
@@ -2226,6 +3052,10 @@ def render_markdown(report: Dict[str, Any]) -> str:
         todo.append(
             f"- `{item['worker']}` changed the main checkout: {change_text(item['diff'])}, see `{item['diffPath']}`."
         )
+    value = totals["value"]
+    if value and value["unmarked"]["workers"]:
+        names = ", ".join(f"`{name}`" for name in value["unmarked"]["workers"])
+        todo.append(f"- Mark {names} as used, partial or discarded.")
     if todo:
         lines += ["", "## Left to do", ""] + todo
 
@@ -2241,14 +3071,47 @@ def render_markdown(report: Dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def render_status(report: Dict[str, Any]) -> str:
+    totals = report["totals"]
+    head = [report["title"] or "Orchestration"]
+    if report["playbooks"]:
+        head.append("playbook " + ", ".join(report["playbooks"]))
+    head.append(counted(totals["runs"], "wave"))
+    lines = [" | ".join(head)]
+    waves = []
+    for index, run in enumerate(report["runs"], 1):
+        done = sum(worker["status"] == "succeeded" for worker in run["workers"])
+        waves.append(f"{index}. {run['phase'] or 'wave'} {run['status']} ({done}/{len(run['workers'])})")
+    lines.append("Waves: " + "; ".join(waves))
+    lines.append(f"Spent: {counted(totals['calls'], 'worker call')}, {spend_text(totals['tokens'], totals['costUsd'])}")
+    outer = report["orchestrationBudget"]
+    if outer:
+        used = outer["used"]
+        lines.append("Budget: " + limits_text(outer["limits"], used["calls"], used["reportedCostUsd"], used["reportedTokens"]))
+    follow = report["followUps"]
+    if follow["attention"]:
+        items = []
+        for item in follow["attention"]:
+            why = item["error"] or "; ".join(item["reasons"]) or item["status"]
+            items.append(f"{item['worker']} ({why[:90]})")
+        lines.append("Needs attention: " + "; ".join(items))
+    if follow["worktrees"]:
+        lines.append("Open worktrees: " + ", ".join(item["worker"] for item in follow["worktrees"]))
+    value = totals["value"]
+    if value and value["unmarked"]["workers"]:
+        lines.append("Not marked: " + ", ".join(value["unmarked"]["workers"]))
+    return "\n".join(lines) + "\n"
+
+
 def probe_provider(provider: str) -> Dict[str, Any]:
     command = "agy" if provider == "agy" else provider
     executable = shutil.which(command)
+    launch = launch_command(executable) if executable else None
     version = None
-    if executable:
+    if launch:
         try:
             result = subprocess.run(
-                [executable, "--version"],
+                [*launch, "--version"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -2262,9 +3125,44 @@ def probe_provider(provider: str) -> Dict[str, Any]:
         "provider": provider,
         "installed": executable is not None,
         "executable": executable,
+        "launch": launch,
         "version": version,
         "capabilities": PROVIDER_CAPABILITIES[provider],
     }
+
+
+AUTH_COMMANDS = {"claude": ("auth", "status"), "codex": ("login", "status"), "kimi": ("provider", "list")}
+
+
+def provider_logged_in(provider: str, launch: Optional[List[str]]) -> Optional[bool]:
+    command = AUTH_COMMANDS.get(provider)
+    if not launch or not command:
+        return None
+    try:
+        result = subprocess.run(
+            [*launch, *command],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    output = result.stdout or ""
+    if provider == "claude":
+        try:
+            return bool(json.loads(output).get("loggedIn"))
+        except (json.JSONDecodeError, AttributeError):
+            return None
+    if provider == "codex":
+        if re.search(r"not logged in", output, re.IGNORECASE):
+            return False
+        return True if result.returncode == 0 and re.search(r"logged in", output, re.IGNORECASE) else None
+    return bool(re.search(r"source=(oauth|api)", output))
 
 
 def doctor_payload(policy_path: Path) -> Dict[str, Any]:
@@ -2277,8 +3175,13 @@ def doctor_payload(policy_path: Path) -> Dict[str, Any]:
     except PlanError as plan_error:
         error = str(plan_error)
     providers = [probe_provider(provider) for provider in BUILTIN_PROVIDERS]
+    for entry in providers:
+        entry["loggedIn"] = provider_logged_in(entry["provider"], entry["launch"]) if entry["installed"] else None
     installed = [entry["provider"] for entry in providers if entry["installed"]]
     hints: List[str] = []
+    for entry in providers:
+        if entry["loggedIn"] is False:
+            hints.append(f"{entry['provider']} is installed but not logged in")
     if not python_ok:
         hints.append("python 3.9 or newer is required")
     if not installed:
@@ -2381,6 +3284,7 @@ def update_policy(args: argparse.Namespace, policy_path: Path) -> Dict[str, Any]
         ("maxWallSeconds", args.max_wall_seconds),
         ("maxEstimatedPromptTokens", args.max_estimated_prompt_tokens),
         ("maxReportedCostUsd", args.max_reported_cost_usd),
+        ("maxReportedTokens", args.max_reported_tokens),
     ):
         if value is not None:
             budget[key] = value
@@ -2463,6 +3367,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     report_parser.add_argument("--format", choices=["markdown", "json"], default="markdown")
     report_parser.add_argument("--write", type=Path, help="also save the report to this file")
+    status_parser = subparsers.add_parser(
+        "status", help="print a few lines on where an orchestration stands, to pick it up again"
+    )
+    status_parser.add_argument("runs", nargs="*", type=Path)
+    budget_parser = subparsers.add_parser(
+        "budget", help="show or set the limits for every wave in an orchestration folder"
+    )
+    budget_parser.add_argument("folder", type=Path)
+    budget_parser.add_argument("--max-calls", type=int)
+    budget_parser.add_argument("--max-reported-cost-usd", type=float)
+    budget_parser.add_argument("--max-reported-tokens", type=int)
+    budget_parser.add_argument("--clear", action="store_true", help="remove the orchestration budget")
+    mark_parser = subparsers.add_parser(
+        "mark", help="record whether a worker's result was used, so the report shows what the spend bought"
+    )
+    mark_parser.add_argument("run_dir", type=Path)
+    mark_parser.add_argument("worker")
+    mark_parser.add_argument("mark", choices=list(MARKS))
+    mark_parser.add_argument("--why")
     policy_parser = subparsers.add_parser("policy", help="show or change skill-only preferences")
     policy_parser.add_argument("policy_action", choices=["show", "set", "reset"])
     policy_parser.add_argument("strategy", nargs="?", choices=list(STRATEGIES))
@@ -2479,6 +3402,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     policy_parser.add_argument("--max-wall-seconds", type=int)
     policy_parser.add_argument("--max-estimated-prompt-tokens", type=int)
     policy_parser.add_argument("--max-reported-cost-usd", type=float)
+    policy_parser.add_argument("--max-reported-tokens", type=int)
     policy_parser.add_argument("--cheap-model", nargs="*", metavar="PROVIDER=MODEL")
     policy_parser.add_argument("--cheap-effort", nargs="*", metavar="PROVIDER=EFFORT")
     policy_parser.add_argument("--strong-model", nargs="*", metavar="PROVIDER=MODEL")
@@ -2519,6 +3443,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 atomic_write_text(args.write.expanduser(), text)
             print(text, end="")
             return 0
+        if args.command == "status":
+            print(render_status(build_report(find_run_dirs(args.runs))), end="")
+            return 0
+        if args.command == "budget":
+            updates = {
+                key: value
+                for key, value in (
+                    ("maxCalls", args.max_calls),
+                    ("maxReportedCostUsd", args.max_reported_cost_usd),
+                    ("maxReportedTokens", args.max_reported_tokens),
+                )
+                if value is not None
+            }
+            if args.clear and updates:
+                raise PlanError("pass --clear or new limits, not both")
+            print(json.dumps(budget_payload(args.folder, updates, args.clear), indent=2))
+            return 0
+        if args.command == "mark":
+            print(json.dumps(mark_payload(args.run_dir, args.worker, args.mark, args.why), indent=2, ensure_ascii=False))
+            return 0
         if args.command == "scaffold":
             plan = scaffold_plan(args.strategy, args.workers, args.cwd, args.provider)
             if args.write:
@@ -2545,6 +3489,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "maxConcurrent": plan["maxConcurrent"],
                 "budget": plan["budget"],
                 "policyPath": str(policy_path),
+                "warnings": plan_warnings(plan),
                 "workers": [
                     {
                         "id": worker["id"],

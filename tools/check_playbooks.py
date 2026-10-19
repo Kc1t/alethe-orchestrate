@@ -26,7 +26,7 @@ ADAPTER_REQUIRED = {"command", "args", "promptTransport", "outputFormat", "check
 def condition_pattern(providers):
     ids = "|".join(sorted(set(providers) | BUILT_IN, key=len, reverse=True))
     return re.compile(
-        r"^(not )?(narrow|light|standard|deep|kind:(research|code|review|command|scrap|docs)|"
+        r"^(not )?(narrow|risky|light|standard|deep|kind:(research|code|review|command|scrap|docs)|"
         rf"({ids})-(low|spare)|both-low|all-low|budget-low|({ids})(-[a-z0-9]+)?-above:\d{{1,3}}|"
         r"checks-failed|checks-failed-twice|report-weak|conflict|stuck|no-pass|findings-left)$"
     )

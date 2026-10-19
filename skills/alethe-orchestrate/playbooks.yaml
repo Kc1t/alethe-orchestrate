@@ -17,6 +17,8 @@ principles:
   - Keep a worker's model and effort fixed for its whole session; switching discards its prompt cache.
   - Use xhigh only to escalate, and avoid max.
   - Cap every run with a budget and compare cost per finished task.
+  - Cheap models triage and skip; judging whether code is correct takes the standard tier or above.
+  - A risky unit never runs on the cheap tier, and its diff goes through review-gate.
 
 providers: [claude, codex]
 
@@ -131,6 +133,8 @@ playbooks:
             use: { model: sonnet, effort: high }
           - if: deep
             use: { tier: strong }
+          - if: [risky, light]
+            use: { tier: standard }
           - if: light
             use: { tier: cheap }
       - id: review
@@ -515,8 +519,8 @@ playbooks:
         readOnly: true
         workers: 2
         runner: research
-        does: Check the diff against the repository's rules and conventions.
-        returns: Findings with file:line and the rule each one breaks.
+        does: Check the diff against the repository's rules and conventions; give each reviewer its own focus, such as naming and structure, or tests and error handling.
+        returns: Findings with file:line and the rule each one breaks, plus the checks that passed.
       - id: bugs
         role: bug-hunter
         tier: strong
@@ -532,8 +536,9 @@ playbooks:
         tier: strong
         readOnly: true
         runner: economy
-        does: Confirm or reject each finding against the code.
-        gate: No confirmed finding is left.
+        does: Confirm or reject each finding against the code; a finding two providers reported on their own needs no second check.
+        returns: Each finding confirmed or rejected with evidence, then a VERDICT line of PASS, FAIL or NOT_PROVEN.
+        gate: The verdict is PASS and no confirmed finding is left.
       - id: fix
         role: fixer
         tier: standard

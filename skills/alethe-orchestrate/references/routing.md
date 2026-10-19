@@ -64,10 +64,10 @@ effort, or resumed session.
 
 `budget` holds default execution limits with the same fields a plan accepts: `maxCalls`,
 `maxWallSeconds`, `maxEstimatedPromptTokens`, and `maxReportedCostUsd`. A plan overrides them
-field by field. Note that Alethe's preferences bridge rewrites this whole file from its own
-settings whenever preferences are applied, so fields the app does not know about — including
-`budget` and `modelTiers` — are lost at that point. The onboarding-complete flag is preserved.
-Put durable limits in the plan itself.
+field by field. When Alethe is installed, its Orchestration preferences own the backend, default
+strategy, provider switching, conserved provider and concurrency, and put the preferred provider
+first in the saved order; `budget`, `modelTiers` and the rest of the order stay as `policy set`
+left them.
 
 ```text
 python scripts/orchestrate.py policy set --max-calls 4 --max-wall-seconds 1800

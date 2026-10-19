@@ -8,6 +8,28 @@ what each worker did, why, and what it cost.
 It needs Python 3.9 or newer and at least one agent CLI. It works on its own; inside
 [Alethe](https://github.com/Kc1t/alethe-agents) it can also put workers on Alethe's board.
 
+## What makes it different
+
+- **It shows what the spend bought.** `report` explains what each worker did, why, where it ran,
+  and the tokens and cost its CLI reported, never an estimate. Mark each result used or discarded
+  and the report splits the spend between them.
+- **Limits are enforced, not requested.** The runner checks budgets per wave and across the whole
+  orchestration, hands Claude workers a hard `--max-budget-usd`, turns off subagents in Codex and
+  Claude workers, and refuses to start an orchestration inside a worker.
+- **Lean workers.** Codex and Claude workers start without your MCP servers. In a one-line check on
+  the same machine, a Claude haiku worker took 38,157 tokens ($0.08) with version 12 against
+  76,160 ($0.16) with version 11.
+- **It checks what workers claim.** A read-only worker that changes your checkout is caught by
+  comparing git before and after, and every worker ends with a status line, so blocked or doubtful
+  work lands in the report's to-do list instead of passing as done.
+- **It knows when not to orchestrate.** `dry-run` warns when the briefs are too small to be worth a
+  worker, when a cost limit cannot see some CLIs, and when a writer would mix its diff with your
+  uncommitted changes.
+- **Quota-aware, Windows included.** Work moves to the next provider when one runs low, as Alethe
+  reports or you say, and workers run headless without tmux on Windows, macOS and Linux.
+- **Easy to audit.** Python's standard library only, no network access (a test fails if the runner
+  imports a networking module), no hooks and no install scripts.
+
 ## Install
 
 **Any agent** (Claude Code, Codex, Cursor, Gemini CLI, Antigravity and others):
@@ -21,6 +43,13 @@ npx skills add Kc1t/alethe-orchestrate
 ```text
 /plugin marketplace add Kc1t/alethe-orchestrate
 /plugin install alethe-orchestrate@alethe
+```
+
+**Codex plugin:**
+
+```sh
+codex plugin marketplace add Kc1t/alethe-orchestrate
+codex plugin add alethe-orchestrate@alethe
 ```
 
 **By hand:** copy `skills/alethe-orchestrate` into your agent's skills folder, such as
@@ -82,8 +111,9 @@ Real output from a two-worker run:
 
 The report never estimates. Tokens and cost are what each CLI reported; Claude Code reports cost at
 API prices, so on a subscription that work counted against your plan's limits instead. It also
-lists failures with their last error line, budget stops, changed files, worktrees to review and
-sessions you can resume. `--format json` returns the same data.
+lists failures with their cause and what to do next, workers that said they were blocked, budget
+stops, changed files, worktrees to review and sessions you can resume. `--format json` returns the
+same data, and `status` prints a few lines to pick an orchestration up again.
 
 ## Commands
 
@@ -97,7 +127,10 @@ All commands live in `skills/alethe-orchestrate/scripts/orchestrate.py`.
 | `validate <plan>` | Checks a plan without running it |
 | `dry-run <plan>` | Explains the strategy, providers, models and budget a plan would use |
 | `run <plan>` | Runs one wave and writes its results to a run folder |
+| `budget <folder>` | Shows or sets limits that cover every wave in an orchestration folder |
+| `mark <run> <worker> used\|partial\|discarded` | Records whether a result was kept, for the report's value line |
 | `report [folder]` | Explains what the runs did, why, and what they reported spending |
+| `status [folder]` | Prints where an orchestration stands in a few lines |
 | `policy show\|set\|reset` | Shows or changes saved preferences |
 | `probe`, `strategies` | Lists the installed CLIs and the runner strategies |
 
@@ -110,12 +143,16 @@ All commands live in `skills/alethe-orchestrate/scripts/orchestrate.py`.
 | Policy | `%APPDATA%\Alethe\alethe-orchestrate.json` on Windows, `~/.config/alethe/orchestrate.json` elsewhere. `ALETHE_ORCHESTRATE_POLICY` overrides it |
 | Your playbooks and profiles | `alethe-playbooks.yaml` next to the policy. `ALETHE_ORCHESTRATE_PLAYBOOKS` overrides it |
 | Runs | The temporary directory, or the folder given with `--run-dir` |
+| Orchestration limits | `budget.json` in the orchestration folder, written by `budget` |
 | Worktrees | `<repo>/.alethe/worktrees/`, kept until you remove them and excluded from `git status` |
 
 ## Safety
 
-- Workers start from argument arrays; nothing runs through a shell.
-- Every task carries a contract: no delegation, no commits, pushes, tags or pull requests.
+- Workers start from argument arrays; nothing runs through a shell. On Windows, npm's `.cmd` shims
+  are launched through their real target, so cmd.exe never rewrites a prompt.
+- Every task carries a contract: no delegation, no commits, pushes, tags or pull requests. Codex
+  and Claude workers also cannot start subagents, and no worker can start an orchestration.
+- Read-only workers in a checkout are checked against git afterwards.
 - Flags that remove isolation, such as `--dangerously-skip-permissions` or `--trust-all-tools`,
   are refused unless the plan sets `allowUnsafe` after you agree to it.
 - The parallel strategy gives every writer its own worktree, and the runner never stashes or

@@ -7,13 +7,17 @@ policy.
 
 ## 1. Take inventory
 
-1. Run `doctor` for the built-in CLIs: Codex, Claude Code, Agy / Antigravity and Kimi Code.
+1. Run `doctor` for the built-in CLIs: Codex, Claude Code, Agy / Antigravity and Kimi Code. A CLI
+   with `loggedIn: false` goes in the notes with "log in first", not in `providers`; a run on it
+   would fail with `auth_required`.
 2. Look on PATH for other agent CLIs, such as `gemini`, `kiro-cli`, `copilot` or `opencode`, and for
    routes such as `9router`. Run each one's `--help` before counting it; a CLI that fails to start
    goes in the notes with the fix, not in `providers`. Ask: "Is there another AI CLI or routing
    tool you want to use?" Accept a name or executable path.
 3. List each CLI's models when it has a command for that, such as `agy models` or
-   `kiro-cli chat --list-models --format json`. Keep cost multipliers the CLI reports.
+   `kiro-cli chat --list-models --format json`. Keep cost multipliers the CLI reports. Codex keeps
+   its list in `models_cache.json` under its home folder (`~/.codex` by default); read that file
+   instead of starting a session.
 4. Record a custom adapter only after `--help` shows a non-interactive prompt mode, and write down
    the command you checked. Never guess flags or credentials. A custom adapter cannot enforce
    read-only work, so it only takes writing phases; see [providers.md](providers.md).

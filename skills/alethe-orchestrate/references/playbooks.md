@@ -136,6 +136,7 @@ negate it. `<provider>` is any provider id and `<window>` one of its windows abo
 | Condition | Holds when |
 |---|---|
 | `narrow` | The task is small and clear, up to about 3 files |
+| `risky` | The unit changes an API contract, a database schema or migration, authentication, cryptography or secrets, or deletes data. Judge it by the operation, not by a word such as "auth" in the brief |
 | `kind:<kind>` | The unit's kind is `research`, `code`, `review`, `command`, `scrap` or `docs` |
 | `light`, `standard`, `deep` | The unit's effort class |
 | `<provider>-low` | A main window of that provider is past `criticalThreshold`, it is listed in `conserveProviders`, or the user said its tokens are running out |

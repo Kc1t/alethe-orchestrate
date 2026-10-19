@@ -1,0 +1,25 @@
+{
+  "name": "alethe-orchestrate",
+  "version": "12.0.0",
+  "description": "Plan with your agent and hand bounded work to Codex, Claude Code, Antigravity, Kimi or any CLI agent, following playbooks that save context and quota, then report what each run did and cost.",
+  "author": {
+    "name": "Kauã Miguel",
+    "url": "https://github.com/Kc1t"
+  },
+  "homepage": "https://github.com/Kc1t/alethe-orchestrate",
+  "repository": "https://github.com/Kc1t/alethe-orchestrate",
+  "license": "MIT",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Alethe Orchestrate",
+    "shortDescription": "Hand bounded work to other coding CLIs and report what it cost.",
+    "longDescription": "Turns the agent into a planner: it picks a playbook, sends bounded units to Codex, Claude Code, Antigravity, Kimi or a custom CLI on the cheapest capable model, keeps transcripts out of the lead's context, and reports what each worker did, why, and what its CLI reported it cost.",
+    "developerName": "Kauã Miguel",
+    "category": "Productivity",
+    "capabilities": ["Interactive", "Read", "Write"],
+    "defaultPrompt": [
+      "Orchestrate this task with the cheapest workers that can do it",
+      "Report what the last orchestration did and what it cost"
+    ]
+  }
+}

@@ -8,16 +8,17 @@ runner uses argument arrays and never passes commands through a shell.
 | Provider | Executable | Read-only | Write | Resume | Structured result |
 |---|---|---:|---:|---:|---:|
 | Codex | `codex` | sandbox `read-only` | sandbox `workspace-write` | `codex exec resume` | JSONL events + final message |
-| Claude Code | `claude` | permission mode `plan` | `acceptEdits` | `--resume` | JSON result |
+| Claude Code | `claude` | permission mode `plan` | `acceptEdits` | `--resume` | stream JSON |
 | Agy / Antigravity | `agy` | mode `plan` | `accept-edits` | `--conversation` | JSON result |
-| Kimi Code | `kimi` | worker contract (see below) | `--yolo` | `--session` | stream JSON |
+| Kimi Code | `kimi` | none (see below) | prompt mode | `--session` | stream JSON |
 
 `antigravity` is accepted as an alias for `agy` in plans.
 
 Use `provider: auto` for a new worker with no provider-specific model, effort, or session. The
 runner selects the first installed provider in the saved `providerOrder` that is not listed in
-`conserveProviders`. Explicit providers are switched only when `providerSwitch` is `automatic`;
-otherwise they are honored or validation asks for a decision.
+`conserveProviders` and can run the worker: read-only work never goes to Kimi. Explicit providers
+are switched only when `providerSwitch` is `automatic`; otherwise they are honored or validation
+asks for a decision.
 
 The runner probes optional flags from local help where needed. CLI behavior changes over time, so
 check the generated `stderr.log` and `outcome.json` rather than treating process exit alone as
@@ -26,32 +27,59 @@ success.
 The equivalent new-session command shapes are:
 
 ```text
-codex exec --json --sandbox read-only|workspace-write --cd <cwd> --output-last-message <result> -
-claude --print --output-format json --permission-mode plan|acceptEdits
-agy --output-format json --mode plan|accept-edits --print-timeout <seconds>s --print=<task>
-kimi --prompt <task> --output-format stream-json [--yolo]
+codex --disable multi_agent exec --sandbox read-only|workspace-write --json --output-last-message <result> --cd <cwd> --config mcp_servers={} -
+claude --print --output-format stream-json --verbose --permission-mode plan|acceptEdits --disallowedTools Agent,Workflow --strict-mcp-config [--max-budget-usd <cap>]
+agy --output-format json --mode plan|accept-edits --print-timeout <seconds>s --add-dir <cwd> --print=<task>
+kimi --output-format stream-json --prompt=<task>
 ```
 
 Codex and Claude receive the task through standard input. Agy and Kimi require it attached to the
 prompt flag: Agy's `--print` otherwise swallows the next flag as the prompt and ignores the real
-one, so the runner always uses the attached `--print=<task>` form. Keep stdout and stderr in
-separate files and enforce an external deadline even when a provider also offers its own timeout.
+one. Because the prompt is an argument for them, validation refuses a task longer than about 30,000
+characters on Windows or 100,000 elsewhere. Keep stdout and stderr in separate files and enforce an
+external deadline even when a provider also offers its own timeout.
+
+## What the runner turns off
+
+- **Subagents.** Codex workers run with its `multi_agent` features disabled and Claude workers with
+  the `Agent` and `Workflow` tools denied, so neither can fan out on its own. Agy, Kimi and custom
+  workers rely on the worker contract. Every worker also runs with `ALETHE_ORCHESTRATE_WORKER=1`,
+  and `run` refuses to start inside a worker.
+- **MCP servers.** Codex gets an empty `mcp_servers` table and Claude `--strict-mcp-config`, so
+  workers skip the startup time and the tool definitions of every server the user configured. In
+  one check, a one-line Claude haiku answer took about half the tokens this way. Set `mcp: true` on
+  a worker whose brief needs a server.
+- **Overspending.** A Claude worker gets the reported-cost budget left for it as `--max-budget-usd`,
+  so Claude stops it once it has spent that much, after the call that crosses the line.
 
 Claude `acceptEdits` does not approve every shell command. The runner requests non-interactive
-permission handling when the installed CLI supports it; a denied command remains a worker failure
-or limitation for the lead to handle.
+permission handling when the installed CLI supports it; a denied command shows up as
+`permissionDenials` in `outcome.json`, and the report warns that the worker's checks may not have
+run.
 
-Kimi cannot combine `--plan` with `--prompt`, so a read-only Kimi worker runs in the default mode
-and read-only behavior is enforced by the worker contract instead of a CLI sandbox; prefer Codex,
-Claude, or Agy for untrusted read-only investigations. Kimi `--yolo` still follows Kimi's own Ask
-When Needed policy. Use isolated worktrees for Kimi writers and do not replace it with `--auto`;
-the runner treats `--auto` as an unsafe custom flag.
+Kimi's prompt mode always runs in Kimi's auto permission mode, which approves every tool, and it
+refuses `--plan`, `--yolo` and `--auto` together with `--prompt`. So read-only Kimi work rests on the
+worker contract alone, checked afterwards by the read-only tripwire, and a Kimi writer belongs in an
+isolated worktree. `validate` warns about both.
+
+If an Agy read-only worker returns nothing, its plan mode may have stopped at a command it could
+not approve without a person; give that read to Codex or Claude.
+
+## Windows
+
+npm installs CLIs such as `codex`, `claude`, `kimi` and `gemini` as `.cmd` shims. cmd.exe re-parses
+every argument of a batch file: it cuts an argument at its first newline and runs whatever follows
+an unbalanced quote. The runner reads npm's shim and launches its real target directly, either
+`node <script>` or the native executable, and `probe` shows that as `launch`. A batch file it cannot
+read is refused when an argument holds a newline, a quote, `&`, `|`, `<`, `>`, `^`, `%` or `!`; point
+the worker at the real executable instead.
 
 ## Resuming
 
 Copy a successful worker's `sessionId` into a later worker's `resume` field. Keep the provider the
-same. A resumed provider controls its original session directory and permission state; the runner
-cannot retrofit a new Codex sandbox onto an existing session.
+same. Codex resumes with the sandbox of the new worker's mode and its effort; Claude, Agy and Kimi
+keep the settings of the original session. Claude streams its events, so a Claude worker that timed
+out or went quiet still leaves its session id for the rescue strategy.
 
 Resume only a closely related follow-up. If no session ID was emitted, create a new worker with a
 compact handoff instead.

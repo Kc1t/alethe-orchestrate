@@ -33,7 +33,8 @@
         "maxCalls": { "type": "integer", "minimum": 1, "maximum": 64 },
         "maxWallSeconds": { "type": "integer", "minimum": 1, "maximum": 86400 },
         "maxEstimatedPromptTokens": { "type": "integer", "minimum": 1 },
-        "maxReportedCostUsd": { "type": "number", "exclusiveMinimum": 0 }
+        "maxReportedCostUsd": { "type": "number", "exclusiveMinimum": 0 },
+        "maxReportedTokens": { "type": "integer", "minimum": 1 }
       }
     },
     "workers": {
@@ -80,7 +81,9 @@
         "args": { "type": "array", "items": { "type": "string" } },
         "promptTransport": { "enum": ["stdin", "argument"] },
         "outputFormat": { "enum": ["text", "json", "jsonl"] },
-        "allowUnsafe": { "type": "boolean", "default": false }
+        "allowUnsafe": { "type": "boolean", "default": false },
+        "mcp": { "type": "boolean", "default": false },
+        "idleTimeoutSeconds": { "type": "integer", "minimum": 5, "maximum": 86400 }
       },
       "allOf": [
         {

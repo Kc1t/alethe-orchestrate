@@ -2,7 +2,7 @@
 name: alethe-orchestrate
 description: Orchestrate bounded Codex, Claude Code, Agy, Kimi, or custom CLI workers to finish work with the least lead context and provider usage, following strategy playbooks such as plan big, execute small. Use when the user asks to orchestrate, delegate, compare agents, conserve agent tokens or quota, recover a worker, report what an orchestration did and cost, or work without MCP. Do not use for a small mechanical task unless explicitly requested.
 metadata:
-  version: "11"
+  version: "12"
 ---
 
 # Orchestrate CLI workers
@@ -43,6 +43,8 @@ Translate loose configuration requests into actions:
 | "use cheap models for the small stuff" | ask which provider and model, confirm, then `policy set --cheap-model provider=model` |
 | "at most N workers / T minutes / C dollars" as an ongoing preference | confirm, then `policy set --max-calls N --max-wall-seconds T --max-reported-cost-usd C` |
 | any of the above "for this run only" | put it in the plan's `budget` or use `--strategy`; never touch the policy |
+| "at most N calls / C dollars / T tokens for this whole task" | `budget <folder>` with those limits before the first wave |
+| "where were we", or after the conversation was compacted | `status <folder>` before anything else |
 | "back to defaults" | confirm, then `policy reset` |
 | "change the playbooks" or roles per phase | `playbook --init`, then edit the copy it prints; the UI exports the same file |
 | "use savings" or "go aggressive" as an ongoing preference | confirm, then set `profile` in the playbooks copy |
@@ -85,13 +87,16 @@ tiers, the quota and budget rules, the profiles, and the playbooks. [references/
 5. Create a version-1 plan JSON outside the repository. `scripts/orchestrate.py scaffold
    <strategy> --workers N` prints a valid skeleton to fill in. Use `strategy`, and use
    `provider: auto` only when saved provider switching preferences may decide the provider. Set
-   `budget` when the run needs hard limits. Give the plan a `title`, the `playbook` and `phase` it
-   runs, and a one-line `why`; give each worker a short `why` naming its role and the reason for
-   its model. The report shows them. Validate it against
-   [schemas/plan.schema.json](schemas/plan.schema.json) or with `scripts/orchestrate.py validate`.
+   `budget` when the run needs hard limits, and `budget <folder>` when a limit covers every wave.
+   Give the plan a `title`, the `playbook` and `phase` it runs, and a one-line `why`; give each
+   worker a short `why` naming its role and the reason for its model. The report shows them.
+   Write each task as [references/briefs.md](references/briefs.md) describes. Codex and Claude
+   workers start without MCP servers; set `mcp: true` only for a brief that needs one. Validate
+   the plan against [schemas/plan.schema.json](schemas/plan.schema.json) or with
+   `scripts/orchestrate.py validate`.
 6. Preview with `scripts/orchestrate.py dry-run`. It explains the resolved strategy, the effective
    provider per worker, the concurrency, the estimated prompt tokens, and the budget that would
-   apply, without starting anything.
+   apply, without starting anything. Fix its `warnings` or say why they do not apply.
    When the user wants to see the architecture, save the preview with `dry-run --write`, then
    render it with `scripts/diagram.py` as described in [references/diagram.md](references/diagram.md).
    Show the SVG before running workers and use only confirmed proxy routes.
@@ -99,14 +104,16 @@ tiers, the quota and budget rules, the profiles, and the playbooks. [references/
    every wave of one orchestration lands in the same folder. The runner never invokes a shell, caps
    concurrency, enforces the plan budget, terminates timed-out process trees, writes state
    atomically, and leaves worktrees for review.
-8. Read `state.json`, each `outcome.json`, the concise `result.md`, and writer `diff.patch` files.
-   Do not load raw logs unless diagnosing a failure.
-9. Integrate reviewed changes, run validation in the combined checkout, then remove only temporary
-   data and worktrees whose useful changes were handled.
+8. Read `state.json`, each `outcome.json` (its `workerStatus`, `failureKind` and
+   `readOnlyViolation` first), the concise `result.md`, and writer `diff.patch` files. Do not load
+   raw logs unless diagnosing a failure.
+9. Integrate reviewed changes, run validation in the combined checkout, `mark` each worker's result
+   `used`, `partial` or `discarded`, then remove only temporary data and worktrees whose useful
+   changes were handled.
 10. Close with `scripts/orchestrate.py report <folder>` and show the user its output: what each
-    worker did and why, the time, tokens and cost the CLIs reported, and what is left to review.
-    Run it whenever the user asks what an orchestration did or cost; without a folder it reads the
-    latest run.
+    worker did and why, the time, tokens and cost the CLIs reported, what the spend bought, and
+    what is left to review. Run it whenever the user asks what an orchestration did or cost;
+    without a folder it reads the latest run.
 
 For plan examples, result semantics, selective dirty-state seeding, and cleanup, read
 [references/operations.md](references/operations.md).
@@ -119,6 +126,13 @@ forbidden changes, and desired handoff. The runner automatically appends these i
 - do not delegate, spawn subagents, or launch another agent CLI
 - do not commit, push, tag, release, or open a pull request
 - return a concise outcome, evidence, changed files, checks, failures, and risks
+- finish with a `STATUS:` line (`DONE`, `DONE_WITH_CONCERNS`, `BLOCKED` or `NEEDS_CONTEXT`) and a
+  `SUMMARY:` line
+
+Codex and Claude workers cannot start subagents: the runner turns that off in the CLI. Every
+worker runs with `ALETHE_ORCHESTRATE_WORKER=1`, so it cannot start an orchestration of its own. A
+worker's status and summary are claims; check its diff. For review, validation, judge and panel
+briefs, follow [references/briefs.md](references/briefs.md).
 
 Do not put secrets in plans, tasks, arguments, or logs. Do not use bypass flags unless the user
 explicitly requested that loss of isolation; custom workers require `allowUnsafe: true` for known
@@ -129,7 +143,8 @@ unsafe flags.
 - Treat statements such as "low on tokens", "save quota", or "economize" as `economy` for the
   current run. Persist it with `policy set economy` only when the user asks for an ongoing default.
 - A plan `budget` turns saving into a hard limit: cap worker calls, wall time, estimated prompt
-  tokens, and reported cost. Use `dry-run` to see the estimate before anything runs.
+  tokens, reported tokens and reported cost. Use `dry-run` to see the estimate before anything
+  runs. Only Claude reports cost, so `maxReportedTokens` is what caps the other CLIs.
 - More workers increase total provider usage. `auto` must choose no orchestration when the task is
   cheaper to finish directly; if orchestration was explicitly requested, it chooses the smallest
   valid strategy.

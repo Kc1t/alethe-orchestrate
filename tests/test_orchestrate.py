@@ -1,3 +1,4 @@
+import ast
 import contextlib
 import importlib.util
 import io
@@ -11,6 +12,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 SKILL = ROOT / "skills" / "alethe-orchestrate"
@@ -39,7 +41,7 @@ def git(cwd, *args):
     ).stdout
 
 
-class RunnerTest(unittest.TestCase):
+class Fixtures(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp(prefix="orchestrate-test-"))
         self.addCleanup(remove_tree, self.root)
@@ -119,6 +121,8 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(code, 0, err)
         return repo, orchestration
 
+
+class RunnerTest(Fixtures):
     def test_plan_notes_reach_the_preview(self):
         plan = self.write_plan(
             "plan",
@@ -249,6 +253,49 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(out)["skill"]["version"], version)
 
+    def test_codex_plugin_manifests_carry_the_skill_version(self):
+        expected = f"{orchestrate.skill_version()}.0.0"
+        plugin = json.loads((ROOT / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))
+        marketplace = json.loads((ROOT / ".agents" / "plugins" / "marketplace.json").read_text(encoding="utf-8"))
+        self.assertEqual(plugin["version"], expected)
+        self.assertEqual([entry["version"] for entry in marketplace["plugins"]], [expected])
+        self.assertTrue((ROOT / plugin["skills"] / "alethe-orchestrate" / "SKILL.md").is_file())
+
+    @unittest.skipUnless(os.name == "nt", "batch files exist only on Windows")
+    def test_npm_style_shims_receive_the_whole_prompt(self):
+        shim = self.root / "fake-agent.cmd"
+        shim.write_text(f'@ECHO off\r\n"{sys.executable}"  "{FAKE}" %*\r\n', encoding="utf-8")
+        recorded = self.root / "argv.json"
+        task = 'First line.\nSecond "line" & echo INJECTED> injected.txt'
+        worker = {
+            **self.worker("shim", "read-only", [], "text", self.root, promptTransport="argument"),
+            "command": str(shim),
+            "args": ["argv", str(recorded)],
+            "task": task,
+        }
+        plan = self.write_plan("shim", {"version": 1, "workers": [worker]})
+        code, _, err = self.call("run", plan, "--run-dir", self.root / "run", "--policy", self.policy)
+        self.assertEqual(code, 0, err)
+        prompt = json.loads(recorded.read_text(encoding="utf-8"))[-1]
+        self.assertTrue(prompt.startswith(task + "\n\nRuntime contract:"), prompt)
+        self.assertFalse((self.root / "injected.txt").exists())
+
+    @unittest.skipUnless(os.name == "nt", "batch files exist only on Windows")
+    def test_unknown_batch_files_refuse_arguments_cmd_would_rewrite(self):
+        shim = self.root / "wrapper.cmd"
+        shim.write_text('@ECHO off\r\ncall "%~dp0missing.exe" %*\r\n', encoding="utf-8")
+        worker = {
+            **self.worker("wrapped", "read-only", [], "text", self.root, promptTransport="argument"),
+            "command": str(shim),
+            "args": [],
+        }
+        plan = self.write_plan("wrapped", {"version": 1, "workers": [worker]})
+        code, out, _ = self.call("run", plan, "--run-dir", self.root / "run", "--policy", self.policy)
+        self.assertEqual(code, 1)
+        outcome = json.loads(out)["workers"][0]
+        self.assertEqual(outcome["status"], "failed")
+        self.assertIn("is a batch file", outcome["error"])
+
     def test_the_preview_renders_as_a_diagram(self):
         plan = self.write_plan("plan", {"version": 1, "workers": [self.worker("map", "read-only", ["claude"], "json", self.root)]})
         preview = self.root / "preview.json"
@@ -260,6 +307,228 @@ class RunnerTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("<svg", svg.read_text(encoding="utf-8"))
+
+
+class InvocationTest(unittest.TestCase):
+    HELP = "--permission-prompts --disable-slash-commands --disallowedTools --strict-mcp-config --max-budget-usd --add-dir"
+    FEATURES = "multi_agent                              stable             true\nmulti_agent_v2                           stable             false\n"
+
+    def build(self, provider, mode="write", cost_cap=None, **extra):
+        worker = {
+            "id": "w",
+            "provider": provider,
+            "mode": mode,
+            "model": None,
+            "effort": None,
+            "resume": None,
+            "mcp": False,
+            "task": "Do the unit.\n- second line",
+            **extra,
+        }
+        outputs = lambda args, cache, lock: self.FEATURES if args[-2:] == ["features", "list"] else self.HELP
+        root = Path(tempfile.mkdtemp(prefix="invocation-test-"))
+        self.addCleanup(remove_tree, root)
+        with mock.patch.object(orchestrate, "resolve_executable", lambda name: name), mock.patch.object(
+            orchestrate, "launch_command", lambda executable: [executable]
+        ), mock.patch.object(orchestrate, "command_output", outputs), mock.patch.object(
+            orchestrate, "in_git_worktree", lambda cwd: True
+        ):
+            return orchestrate.build_invocation(worker, root, root, {}, None, 60, cost_cap)[0]
+
+    def test_kimi_takes_the_prompt_attached_and_never_yolo(self):
+        args = self.build("kimi")
+        self.assertNotIn("--yolo", args)
+        self.assertEqual(args[-1], "--prompt=Do the unit.\n- second line")
+
+    def test_codex_resume_keeps_the_sandbox_and_effort(self):
+        args = self.build("codex", effort="high", resume="thread-1")
+        self.assertEqual(args[:5], ["codex", "--disable", "multi_agent", "--disable", "multi_agent_v2"])
+        self.assertLess(args.index("--sandbox"), args.index("resume"))
+        self.assertGreater(args.index("model_reasoning_effort=high"), args.index("resume"))
+        self.assertIn("mcp_servers={}", args)
+        self.assertEqual(args[-2:], ["thread-1", "-"])
+
+    def test_claude_streams_and_cannot_start_agents(self):
+        args = self.build("claude", cost_cap=0.5)
+        self.assertIn("stream-json", args)
+        self.assertIn("--verbose", args)
+        self.assertEqual(args[args.index("--disallowedTools") + 1], "Agent,Workflow")
+        self.assertIn("--strict-mcp-config", args)
+        self.assertEqual(args[args.index("--max-budget-usd") + 1], "0.50")
+        self.assertNotIn("--strict-mcp-config", self.build("claude", mcp=True))
+
+    def test_json_output_survives_noise(self):
+        self.assertEqual(len(orchestrate.json_values('{"a": 1}\nnot json\n{"b": 2}\n', "jsonl")), 2)
+        self.assertEqual(orchestrate.json_values('warning: slow\n{"type": "result"}\n', "json"), [{"type": "result"}])
+
+    def test_handoff_lines_are_read_from_markdown(self):
+        handoff = orchestrate.parse_handoff("Did it.\n**STATUS:** done_with_concerns\n- SUMMARY: Parser fixed.\nVerdict: not proven")
+        self.assertEqual(handoff, {"workerStatus": "DONE_WITH_CONCERNS", "workerSummary": "Parser fixed.", "verdict": "NOT_PROVEN"})
+
+
+class GuardTest(Fixtures):
+    def run_plan(self, name, workers, run_dir=None, **plan):
+        path = self.write_plan(name, {"version": 1, "workers": workers, **plan})
+        run_dir = run_dir or self.root / f"run-{name}"
+        code, out, err = self.call("run", path, "--run-dir", run_dir, "--policy", self.policy)
+        return code, (json.loads(out) if out.strip() else None), err, run_dir
+
+    def test_read_only_workers_that_write_are_caught(self):
+        repo = self.make_repo()
+        workers = [
+            self.worker("honest", "read-only", ["say", "Read it."], "text", repo),
+            self.worker("sneaky", "read-only", ["write", "new.txt"], "text", repo),
+        ]
+        code, result, err, _ = self.run_plan("tripwire", workers, run_dir=repo / ".orchestration" / "01-read", maxConcurrent=1)
+        self.assertEqual(code, 0, err)
+        outcomes = {item["id"]: item for item in result["workers"]}
+        self.assertFalse(outcomes["honest"]["readOnlyViolation"])
+        self.assertTrue(outcomes["sneaky"]["readOnlyViolation"])
+        self.assertEqual(outcomes["sneaky"]["touchedFiles"], ["new.txt"])
+        report = json.loads(self.call("report", repo / ".orchestration", "--format", "json")[1])
+        flagged = {item["worker"]: item for item in report["followUps"]["attention"]}
+        self.assertIn("changed the checkout while read-only (new.txt)", flagged["sneaky"]["reasons"][0])
+
+    def test_handoff_status_and_denied_tools_reach_the_report(self):
+        workers = [
+            self.worker("stuck", "read-only", ["say", "Looked.\nSTATUS: BLOCKED\nSUMMARY: Needs the API key name."], "text", self.root),
+            self.worker("denied", "read-only", ["denied"], "jsonl", self.root),
+        ]
+        code, result, err, run_dir = self.run_plan("handoff", workers, maxConcurrent=1)
+        self.assertEqual(code, 0, err)
+        outcomes = {item["id"]: item for item in result["workers"]}
+        self.assertEqual(outcomes["stuck"]["workerStatus"], "BLOCKED")
+        self.assertEqual(outcomes["denied"]["permissionDenials"], ["Bash"])
+        self.assertEqual(outcomes["denied"]["billedModels"], ["claude-haiku-4-5"])
+        report = json.loads(self.call("report", run_dir, "--format", "json")[1])
+        self.assertEqual(report["totals"]["workerStatuses"], {"BLOCKED": 1, "DONE": 1})
+        stuck = report["runs"][0]["workers"][0]
+        self.assertEqual(stuck["summary"], "Needs the API key name.")
+        markdown = self.call("report", run_dir)[1]
+        self.assertIn("| succeeded, blocked |", markdown)
+        self.assertIn("1 tool call denied (Bash), so its checks may not have run", markdown)
+
+    def test_failures_are_classified_with_a_hint(self):
+        code, result, _, run_dir = self.run_plan("limits", [self.worker("limited", "read-only", ["ratelimit"], "text", self.root)])
+        self.assertEqual(code, 1)
+        outcome = result["workers"][0]
+        self.assertEqual(outcome["failureKind"], "rate_limited")
+        self.assertIn("resets at 5:00 PM", outcome["resetHint"])
+        markdown = self.call("report", run_dir)[1]
+        self.assertIn("The provider hit a usage limit; run the unit on the next provider", markdown)
+
+    def test_a_quiet_worker_is_stopped_by_its_idle_timeout(self):
+        worker = self.worker("quiet", "read-only", ["sleep", "30"], "text", self.root, idleTimeoutSeconds=5)
+        code, result, _, _ = self.run_plan("quiet", [worker])
+        self.assertEqual(code, 1)
+        outcome = result["workers"][0]
+        self.assertEqual((outcome["status"], outcome["failureKind"]), ("timed_out", "stalled"))
+        self.assertEqual(outcome["error"], "worker printed nothing for 5s")
+        self.assertLess(outcome["durationSeconds"], 25)
+
+    def test_workers_get_a_marked_environment_and_cannot_orchestrate(self):
+        with mock.patch.dict(os.environ, {"CLAUDECODE": "1"}):
+            code, result, err, run_dir = self.run_plan("env", [self.worker("probe", "read-only", ["env"], "text", self.root)])
+        self.assertEqual(code, 0, err)
+        seen = json.loads((run_dir / "workers" / "probe" / "result.md").read_text(encoding="utf-8"))
+        self.assertEqual(seen, {"ALETHE_ORCHESTRATE_WORKER": "1", "CLAUDECODE": None})
+        with mock.patch.dict(os.environ, {"ALETHE_ORCHESTRATE_WORKER": "1"}):
+            code, _, err, _ = self.run_plan("nested", [self.worker("inner", "read-only", ["say", "x"], "text", self.root)])
+        self.assertEqual(code, 2)
+        self.assertIn("workers cannot start orchestrations", err)
+
+    def test_an_orchestration_budget_spans_every_wave(self):
+        folder = self.root / "orchestration"
+        code, out, err = self.call("budget", folder, "--max-calls", "2")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["remaining"], {"calls": 2})
+        one = [self.worker("first", "read-only", ["say", "One."], "text", self.root)]
+        self.assertEqual(self.run_plan("w1", one, run_dir=folder / "01-a")[0], 0)
+        two = [self.worker(name, "read-only", ["say", "Two."], "text", self.root) for name in ("second", "third")]
+        code, result, _, _ = self.run_plan("w2", two, run_dir=folder / "02-b", maxConcurrent=1)
+        self.assertEqual(code, 1)
+        statuses = sorted((item["id"], item["status"]) for item in result["workers"])
+        self.assertEqual(statuses, [("second", "succeeded"), ("third", "skipped")])
+        code, _, err, _ = self.run_plan("w3", one, run_dir=folder / "03-c")
+        self.assertEqual(code, 2)
+        self.assertIn("orchestration budget maxCalls 2 exhausted", err)
+        markdown = self.call("report", folder)[1]
+        self.assertIn("- **Orchestration budget:** 2 of 2 calls", markdown)
+
+    def test_reported_tokens_cap_workers_that_report_no_cost(self):
+        repo = self.make_repo()
+        workers = [
+            self.worker("big", "write", ["codex", "{result}", "README.md"], "jsonl", repo),
+            self.worker("next", "read-only", ["say", "Later."], "text", repo),
+        ]
+        code, result, _, _ = self.run_plan("tokens", workers, maxConcurrent=1, budget={"maxReportedTokens": 1000})
+        self.assertEqual(code, 1)
+        skipped = [item for item in result["workers"] if item["status"] == "skipped"]
+        self.assertEqual(skipped[0]["error"], "budget maxReportedTokens 1000 exhausted")
+
+    def test_marks_show_what_the_spend_bought(self):
+        _, orchestration = self.run_two_waves()
+        self.assertEqual(self.call("mark", orchestration / "01-explore", "map-callers", "used", "--why", "found every caller")[0], 0)
+        self.assertEqual(self.call("mark", orchestration / "02-build", "rename", "discarded")[0], 0)
+        self.assertEqual(self.call("mark", orchestration / "02-build", "missing", "used")[0], 2)
+        report = json.loads(self.call("report", orchestration, "--format", "json")[1])
+        value = report["totals"]["value"]
+        self.assertEqual((value["used"]["workers"], value["used"]["tokens"], value["used"]["costUsd"]), (["map-callers"], 23000, 0.0421))
+        self.assertEqual((value["discarded"]["workers"], value["discarded"]["tokens"]), (["rename"], 54100))
+        self.assertEqual(sorted(value["unmarked"]["workers"]), ["add-file", "broken"])
+        markdown = self.call("report", orchestration)[1]
+        self.assertIn("- **Value:** 1 result used ($0.04, 23,000 tokens); 1 result discarded (no cost reported, 54,100 tokens); 2 results not marked", markdown)
+        status = self.call("status", orchestration)[1].splitlines()
+        self.assertLessEqual(len(status), 8)
+        self.assertEqual(status[1], "Waves: 1. explore partial (1/3); 2. build done (2/2)")
+        self.assertTrue(any(line.startswith("Not marked: ") for line in status))
+
+    def test_previews_warn_before_money_is_spent(self):
+        repo = self.make_repo()
+        (repo / "README.md").write_text("dirty\n", encoding="utf-8")
+        workers = [
+            self.worker("a", "write", ["write", "a.txt"], "text", repo),
+            self.worker("b", "write", ["write", "b.txt"], "text", repo, isolate=True),
+        ]
+        plan = self.write_plan("warn", {"version": 1, "strategy": "balanced", "budget": {"maxReportedCostUsd": 1}, "workers": workers})
+        code, out, err = self.call("dry-run", plan, "--policy", self.policy)
+        self.assertEqual(code, 0, err)
+        warnings = json.loads(out)["warnings"]
+        self.assertTrue(any("maxReportedCostUsd only sees cost that Claude reports" in text for text in warnings), warnings)
+        self.assertTrue(any("2 writers with short briefs" in text for text in warnings), warnings)
+        self.assertTrue(any(text.startswith("a writes in a checkout with uncommitted changes") for text in warnings), warnings)
+
+    def test_auto_never_sends_read_only_work_to_kimi(self):
+        policy = {**orchestrate.DEFAULT_POLICY, "providerOrder": ["kimi", "codex"]}
+        with mock.patch.object(orchestrate, "available_builtin_providers", lambda: ["kimi", "codex"]):
+            reader = orchestrate.choose_provider("auto", {"id": "r", "mode": "read-only"}, policy)
+            writer = orchestrate.choose_provider("auto", {"id": "w", "mode": "write"}, policy)
+        self.assertEqual((reader, writer), ("codex", "kimi"))
+
+    def test_argument_prompts_respect_the_command_line_limit(self):
+        worker = self.worker("long", "read-only", [], "text", self.root, promptTransport="argument")
+        worker["task"] = "x" * (orchestrate.ARGUMENT_PROMPT_LIMIT + 1)
+        code, _, err = self.call("validate", self.write_plan("long", {"version": 1, "workers": [worker]}), "--policy", self.policy)
+        self.assertEqual(code, 2)
+        self.assertIn("as an argument limited to", err)
+
+    def test_a_repository_without_commits_keeps_the_worker_result(self):
+        repo = self.root / "fresh"
+        repo.mkdir()
+        git(repo, "init", "-q")
+        code, result, err, _ = self.run_plan("fresh", [self.worker("first", "write", ["write", "a.txt"], "text", repo)])
+        self.assertEqual(code, 0, err)
+        outcome = result["workers"][0]
+        self.assertEqual(outcome["status"], "succeeded")
+        self.assertIn("no commits yet", outcome["diffError"])
+
+    def test_the_runner_never_imports_a_network_module(self):
+        banned = {"socket", "ssl", "http", "urllib", "ftplib", "smtplib", "imaplib", "poplib", "xmlrpc", "asyncio", "webbrowser"}
+        for script in (SCRIPT, SKILL / "scripts" / "diagram.py"):
+            tree = ast.parse(script.read_text(encoding="utf-8"))
+            names = {alias.name.split(".")[0] for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names}
+            names |= {node.module.split(".")[0] for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.module}
+            self.assertFalse(names & banned, f"{script.name} imports {sorted(names & banned)}")
 
 
 if __name__ == "__main__":
