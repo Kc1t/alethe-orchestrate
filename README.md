@@ -18,7 +18,7 @@
 
   <p align="center">
     <a href="https://github.com/Kc1t/alethe-orchestrate-skill/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/Kc1t/alethe-orchestrate-skill/actions/workflows/ci.yml/badge.svg"></a>
-    <a href="./CHANGELOG.md"><img alt="Skill version" src="https://img.shields.io/badge/skill-v15-4f46e5?style=flat-square"></a>
+    <a href="./CHANGELOG.md"><img alt="Skill version" src="https://img.shields.io/badge/skill-v16-4f46e5?style=flat-square"></a>
     <a href="./LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square"></a>
     <img alt="Python 3.9+ optional" src="https://img.shields.io/badge/python-3.9%2B%20optional-3776ab?style=flat-square&logo=python&logoColor=white">
     <img alt="Windows, macOS and Linux" src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-555?style=flat-square">
@@ -376,7 +376,7 @@ codex plugin add alethe-orchestrate@alethe
 Then ask your agent to set up orchestration, and after that, ask in plain words: "orchestrate this
 refactor", "use savings for now", "what did that run cost?".
 
-In Claude Code the plugin adds `/alethe`. Elsewhere, write the same words after the skill's name.
+Every install adds `/alethe`, a short skill that hands its words to alethe-orchestrate. In an agent without slash commands, write the same words after "alethe".
 
 | Type | It does |
 | --- | --- |

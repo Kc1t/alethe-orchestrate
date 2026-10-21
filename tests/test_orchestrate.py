@@ -586,7 +586,7 @@ class GuardTest(Fixtures):
         hooks = json.loads((ROOT / "hooks" / "hooks.json").read_text(encoding="utf-8"))
         command = hooks["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
         self.assertIn("${CLAUDE_PLUGIN_ROOT}/skills/alethe-orchestrate/scripts/orchestrate.py\" hook", command)
-        alethe = (ROOT / "commands" / "alethe.md").read_text(encoding="utf-8")
+        alethe = (ROOT / "skills" / "alethe" / "SKILL.md").read_text(encoding="utf-8")
         self.assertIn("$ARGUMENTS", alethe)
         self.assertIn('"Short commands"', alethe)
         self.assertIn("## Short commands", (SKILL / "SKILL.md").read_text(encoding="utf-8"))

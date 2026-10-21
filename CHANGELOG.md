@@ -3,6 +3,13 @@
 The version is the integer in `skills/alethe-orchestrate/SKILL.md` under `metadata.version`.
 Alethe installs and updates the skill by that number.
 
+## 16 (2026-10-21)
+
+Added:
+
+- `/alethe` is now a skill of its own, so it comes with `npx skills add` and works in every agent,
+  not only in the Claude Code plugin. It replaces the plugin command of the same name.
+
 ## 15 (2026-10-21)
 
 Added:
