@@ -580,7 +580,16 @@ class GuardTest(Fixtures):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
-        self.addCleanup(process.kill)
+        def finish():
+            if process.poll() is None:
+                (run_dir / "stop").write_text("stop\n", encoding="utf-8")
+                try:
+                    process.communicate(timeout=30)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.communicate()
+
+        self.addCleanup(finish)
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
             state = orchestrate.read_optional_json(run_dir / "state.json")
@@ -589,7 +598,7 @@ class GuardTest(Fixtures):
             time.sleep(0.2)
         code, out, err = self.call("stop", folder)
         self.assertEqual(code, 0, err)
-        self.assertEqual(json.loads(out)["stopping"], [str(run_dir)])
+        self.assertEqual([Path(path).resolve() for path in json.loads(out)["stopping"]], [run_dir.resolve()])
         _, stderr = process.communicate(timeout=30)
         self.assertEqual(process.returncode, 1, stderr)
         state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
