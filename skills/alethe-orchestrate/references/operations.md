@@ -78,6 +78,11 @@ orchestration on for the repository that holds `--cwd` (or that folder outside g
 up to 8, and `--clear-rules` drops them. `mode show` prints the mode, and `mode off` removes it. A
 mode with no prompt for 12 hours is dropped.
 
+`mode on --everywhere` sets a default that applies in every project and never expires. `mode off`
+inside a project then turns it off there only (listed under `offIn` in `modes.json`), `mode on`
+there brings it back, and `mode off --everywhere` removes the default and those exceptions. A
+project mode always wins over the default. `mode show` says which one applies, as `source`.
+
 `hook` reads an agent hook's JSON from stdin and prints a one-paragraph reminder of the goal, care
 level and rules when the hook's `cwd` is inside a project with a mode on, and nothing otherwise.
 It never fails. The Claude Code plugin runs it on every prompt (`hooks/hooks.json`).

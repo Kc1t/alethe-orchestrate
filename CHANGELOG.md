@@ -3,6 +3,19 @@
 The version is the integer in `skills/alethe-orchestrate/SKILL.md` under `metadata.version`.
 Alethe installs and updates the skill by that number.
 
+## 15 (2026-10-21)
+
+Added:
+
+- `mode on --everywhere` keeps orchestration on in every project with no expiry, so the user never
+  has to call the skill. `mode off` in a project turns it off there only, and a project mode wins
+  over the default. Setup offers it once, with the goal of the active profile.
+
+Changed:
+
+- The skill's description tells agents to use it proactively when a request splits into bounded
+  independent units, so it comes into play without a command in agents that have no prompt hook.
+
 ## 14 (2026-10-21)
 
 Added:

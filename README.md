@@ -18,7 +18,7 @@
 
   <p align="center">
     <a href="https://github.com/Kc1t/alethe-orchestrate/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/Kc1t/alethe-orchestrate/actions/workflows/ci.yml/badge.svg"></a>
-    <a href="./CHANGELOG.md"><img alt="Skill version" src="https://img.shields.io/badge/skill-v14-4f46e5?style=flat-square"></a>
+    <a href="./CHANGELOG.md"><img alt="Skill version" src="https://img.shields.io/badge/skill-v15-4f46e5?style=flat-square"></a>
     <a href="./LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square"></a>
     <img alt="Python 3.9+ optional" src="https://img.shields.io/badge/python-3.9%2B%20optional-3776ab?style=flat-square&logo=python&logoColor=white">
     <img alt="Windows, macOS and Linux" src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-555?style=flat-square">
@@ -138,9 +138,11 @@ for the exact invocations.
 
 ## Call It Once, at Any Point
 
-`/alethe on`, or any instruction that starts with "from now on", keeps orchestration on for the
-project. Every prompt after that carries a short reminder of your goal, care level and rules, and
-the lead decides per request whether to do the work itself or hand parts of it off.
+You do not have to call it at all. Your agent picks the skill up on its own when a request is
+large enough to split, and setup offers to keep it on in every project (`/alethe always`). For
+one project, `/alethe on`, or any instruction that starts with "from now on", is enough. While it
+is on, every prompt carries a short reminder of your goal, care level and rules, and the lead
+decides per request whether to do the work itself or hand parts of it off.
 
 <p align="center">
   <picture>
@@ -385,7 +387,8 @@ In Claude Code the plugin adds `/alethe`. Elsewhere, write the same words after 
 | `/alethe <task>` | Orchestrates the task |
 | `/alethe on`, `save`, `max`, `careful` | Keeps it on for this project, with that goal or care level |
 | `/alethe from now on <instruction>` | Keeps it on and keeps your instruction as a standing rule |
-| `/alethe off` | Turns it off |
+| `/alethe always` | Keeps it on in every project, so you never call it |
+| `/alethe off` | Turns it off, in this project only when it is on everywhere |
 | `/alethe report` | The full report of the current orchestration |
 | `/alethe status` | Where it stands, in a few lines |
 | `/alethe list` | Recent orchestrations, with their waves and spend |
@@ -412,7 +415,7 @@ you.
 | Plan | `scaffold <strategy>` | Prints a starter plan |
 | Plan | `validate <plan>` | Checks a plan without running it |
 | Plan | `dry-run <plan>` | Explains the strategy, providers, models and budget, with warnings |
-| Setup | `mode on\|off\|show` | Keeps orchestration on for a project, with `--goal`, `--care` and `--rule` |
+| Setup | `mode on\|off\|show` | Keeps orchestration on for a project, or with `--everywhere` in all of them, with `--goal`, `--care` and `--rule` |
 | Run | `new <title>` | Starts an orchestration folder and makes it current |
 | Run | `budget [folder]` | Shows or sets limits that cover every wave in an orchestration |
 | Run | `run <plan> --in current` | Runs one wave as the next step of the current orchestration |

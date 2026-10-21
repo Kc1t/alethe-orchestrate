@@ -1,8 +1,8 @@
 ---
 name: alethe-orchestrate
-description: Orchestrate bounded Codex, Claude Code, Agy, Kimi, or custom CLI workers to finish work with the least lead context and provider usage, following strategy playbooks such as plan big, execute small. Use when the user asks to orchestrate, delegate, compare agents, conserve agent tokens or quota, recover a worker, report what an orchestration did and cost, or work without MCP or Python, when the user types /alethe or a short command such as "alethe report" or "alethe stop", and when they want it on from now on, at any point of a task and alongside other skills. Do not use for a small mechanical task unless explicitly requested.
+description: Orchestrate bounded Codex, Claude Code, Agy, Kimi, or custom CLI workers to finish work with the least lead context and provider usage, following strategy playbooks such as plan big, execute small. Use when the user asks to orchestrate, delegate, compare agents, conserve agent tokens or quota, recover a worker, report what an orchestration did and cost, or work without MCP or Python, when the user types /alethe or a short command such as "alethe report" or "alethe stop", and when they want it on from now on, at any point of a task and alongside other skills. Also use it proactively, without being asked, when a request is large enough to split into bounded independent units, such as a multi-file refactor, a migration, an audit or research across many files. Do not use for a small mechanical task unless explicitly requested.
 metadata:
-  version: "14"
+  version: "15"
 ---
 
 # Orchestrate CLI workers
@@ -72,7 +72,9 @@ one action. Commands without a folder act on the current orchestration: the one 
 | a task, in plain words | orchestrate it as the rest of this skill describes |
 | nothing | `status`; with no current orchestration, list these commands in a few lines |
 | `on`, or a standing instruction ("from now on...", "a partir de agora...") | stay on, as below |
-| `off` | `mode off` |
+| `always`, or "always on", "in every project" | `mode on --everywhere` |
+| `off` | `mode off`; with the default on, this turns it off in this project only |
+| `off everywhere` | `mode off --everywhere` |
 | `save`, `balanced`, `max` | `mode on --goal <it>` |
 | `careful` | `mode on --care careful` |
 | `report [folder]` | `report`, and show its output as is, without a summary of your own |
@@ -88,9 +90,17 @@ one action. Commands without a folder act on the current orchestration: the one 
 
 ## Stay on
 
-The user should not have to call this skill on every message. `mode on` keeps it on for the
-current project (the repository root, or the folder) until `mode off`, or after 12 hours without
-a prompt:
+The user should not have to call this skill on every message, or at all. Three things keep it
+in play without a command:
+
+1. Use it proactively whenever a request splits into bounded independent units, even when nobody
+   mentions orchestration, as the description says. Small or tightly coupled work stays with you.
+2. `mode on --everywhere` makes it the default in every project, with no expiry. `mode off` in a
+   project turns it off there only, and `mode off --everywhere` removes the default.
+3. `mode on` keeps it on for the current project (the repository root, or the folder) until
+   `mode off`, or after 12 hours without a prompt. A project mode wins over the default.
+
+Both modes take the same options:
 
 - `--goal save` spends as little as possible, `max` gets the most out of the available agents, and
   `balanced` (the default) delegates only when the playbook says it pays.
@@ -102,8 +112,8 @@ Turn it on when the user says `/alethe on`, gives a standing instruction, or ask
 "from now on". Map the instruction to a goal or care level when one fits, and keep the user's own
 words as a rule. Confirm in one line what is now on, then go back to what they were doing.
 
-While it is on, the Claude Code plugin's hook reminds you on every prompt; without the plugin, run
-`mode show` after the conversation is compacted. Treat each request on its own: answer or do small
+While a mode is on, the Claude Code plugin's hook reminds you on every prompt; without the plugin,
+run `mode show` at the start of a session and after the conversation is compacted. Treat each request on its own: answer or do small
 work yourself, and orchestrate only the parts where delegation pays for its overhead under the
 goal. Nothing has to be orchestrated just because the mode is on.
 

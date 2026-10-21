@@ -558,6 +558,30 @@ class GuardTest(Fixtures):
         self.assertEqual(json.loads(self.call("mode", "off", "--cwd", repo)[1])["on"], False)
         self.assertEqual(self.hook(repo), "")
 
+    def test_a_mode_on_everywhere_needs_no_call_and_can_be_turned_off_per_project(self):
+        repo = self.make_repo()
+        other = self.root / "elsewhere"
+        other.mkdir()
+        self.assertEqual(self.call("mode", "on", "--everywhere", "--goal", "save")[0], 0)
+        self.assertIn("on in every project", self.hook(other))
+        self.assertIn("Goal: save", self.hook(repo))
+        with mock.patch.object(orchestrate.time, "time", return_value=time.time() + 10 * orchestrate.MODE_IDLE_SECONDS):
+            self.assertIn("on in every project", self.hook(other))
+
+        self.assertEqual(self.call("mode", "off", "--cwd", repo)[0], 0)
+        self.assertEqual(self.hook(repo), "")
+        self.assertIn("on in every project", self.hook(other))
+        self.assertEqual(json.loads(self.call("mode", "show", "--cwd", other)[1])["source"], "everywhere")
+
+        self.call("mode", "on", "--cwd", repo, "--care", "careful")
+        reminder = self.hook(repo)
+        self.assertIn("on for this project", reminder)
+        self.assertIn("Careful:", reminder)
+
+        self.assertEqual(self.call("mode", "off", "--everywhere")[0], 0)
+        self.assertEqual(self.hook(other), "")
+        self.assertIn("on for this project", self.hook(repo))
+
     def test_the_plugin_hook_and_command_point_at_the_runner(self):
         hooks = json.loads((ROOT / "hooks" / "hooks.json").read_text(encoding="utf-8"))
         command = hooks["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]

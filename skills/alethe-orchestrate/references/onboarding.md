@@ -56,7 +56,10 @@ save or start workers before the user approves.
 2. Run `policy set --provider-order` with the active profile's built-in CLIs, or `policy set` with
    no options when the defaults fit, so `doctor` records onboarding as complete. A choice limited
    to one run stays out of the policy.
-3. Offer a preview diagram of the active profile.
+3. Ask once: "Keep orchestration on in every project, so you never have to call it?" On yes,
+   run `mode on --everywhere` with the goal that matches the active profile: `save` for savings,
+   `max` for aggressive, `balanced` otherwise. It can be turned off per project later.
+4. Offer a preview diagram of the active profile.
 
 Later, "use savings" or "go aggressive" changes `profile` in the copy; confirm it when it is an
 ongoing change, or apply it to this run only.

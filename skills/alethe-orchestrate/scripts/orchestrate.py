@@ -2321,37 +2321,45 @@ def mode_scope(cwd: Path) -> Path:
     return checkout_root(cwd) or cwd
 
 
-def live_modes(now: float) -> Dict[str, Any]:
+def read_mode_state(now: float) -> Dict[str, Any]:
     raw = read_optional_json(orchestrations_home() / MODES_FILE)
-    modes = raw.get("modes") if isinstance(raw, dict) else None
-    if not isinstance(modes, dict):
-        return {}
+    raw = raw if isinstance(raw, dict) else {}
+    modes = raw.get("modes") if isinstance(raw.get("modes"), dict) else {}
+    everywhere = raw.get("everywhere")
     return {
-        scope: mode
-        for scope, mode in modes.items()
-        if isinstance(mode, dict) and now - float(number(mode.get("seenAt")) or 0) < MODE_IDLE_SECONDS
+        "modes": {
+            scope: mode
+            for scope, mode in modes.items()
+            if isinstance(mode, dict) and now - float(number(mode.get("seenAt")) or 0) < MODE_IDLE_SECONDS
+        },
+        "everywhere": everywhere if isinstance(everywhere, dict) else None,
+        "offIn": [scope for scope in raw.get("offIn") or [] if isinstance(scope, str)],
     }
 
 
-def save_modes(modes: Dict[str, Any]) -> None:
+def save_mode_state(state: Dict[str, Any]) -> None:
     home = orchestrations_home()
     home.mkdir(parents=True, exist_ok=True)
-    atomic_write_json(home / MODES_FILE, {"version": 1, "modes": modes})
+    atomic_write_json(home / MODES_FILE, {"version": 1, **state})
 
 
-def mode_payload(
-    action: str, cwd: Path, goal: Optional[str], care: Optional[str], rules: Sequence[str], clear_rules: bool
+def covers(scope: str, here: Path) -> bool:
+    return here == Path(scope) or is_inside(here, Path(scope))
+
+
+def effective_mode(state: Dict[str, Any], here: Path) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    matches = [scope for scope in state["modes"] if covers(scope, here)]
+    if matches:
+        scope = max(matches, key=len)
+        return scope, state["modes"][scope]
+    if state["everywhere"] and not any(covers(scope, here) for scope in state["offIn"]):
+        return None, state["everywhere"]
+    return None, None
+
+
+def updated_mode(
+    mode: Optional[Dict[str, Any]], goal: Optional[str], care: Optional[str], rules: Sequence[str], clear_rules: bool
 ) -> Dict[str, Any]:
-    now = time.time()
-    scope = str(mode_scope(cwd))
-    modes = live_modes(now)
-    if action == "off":
-        modes.pop(scope, None)
-        save_modes(modes)
-        return {"scope": scope, "on": False}
-    mode = modes.get(scope)
-    if action == "show":
-        return {"scope": scope, "on": mode is not None, **(mode or {})}
     mode = dict(mode or {"goal": "balanced", "care": "normal", "rules": [], "since": now_iso()})
     if goal:
         mode["goal"] = goal
@@ -2364,16 +2372,53 @@ def mode_payload(
             kept.append(text)
     if len(kept) > MAX_MODE_RULES:
         raise PlanError(f"keep at most {MAX_MODE_RULES} rules; pass --clear-rules to start over")
-    mode.update(rules=kept, seenAt=now)
-    modes[scope] = mode
-    save_modes(modes)
-    return {"scope": scope, "on": True, **mode}
+    mode["rules"] = kept
+    return mode
 
 
-def mode_reminder(mode: Dict[str, Any]) -> str:
+def mode_payload(
+    action: str,
+    cwd: Path,
+    goal: Optional[str],
+    care: Optional[str],
+    rules: Sequence[str],
+    clear_rules: bool,
+    everywhere: bool = False,
+) -> Dict[str, Any]:
+    now = time.time()
+    state = read_mode_state(now)
+    if everywhere:
+        if action == "off":
+            state.update(everywhere=None, offIn=[])
+            save_mode_state(state)
+        elif action == "on":
+            state["everywhere"] = updated_mode(state["everywhere"], goal, care, rules, clear_rules)
+            save_mode_state(state)
+        return {"everywhere": state["everywhere"]}
+    scope = str(mode_scope(cwd))
+    if action == "show":
+        found, mode = effective_mode(state, Path(scope))
+        source = None if mode is None else "project" if found else "everywhere"
+        return {"scope": scope, "on": mode is not None, "source": source, **(mode or {})}
+    if action == "off":
+        state["modes"].pop(scope, None)
+        if state["everywhere"] and scope not in state["offIn"]:
+            state["offIn"].append(scope)
+        save_mode_state(state)
+        return {"scope": scope, "on": False}
+    state["offIn"] = [entry for entry in state["offIn"] if entry != scope]
+    mode = updated_mode(state["modes"].get(scope), goal, care, rules, clear_rules)
+    mode["seenAt"] = now
+    state["modes"][scope] = mode
+    save_mode_state(state)
+    return {"scope": scope, "on": True, "source": "project", **mode}
+
+
+def mode_reminder(mode: Dict[str, Any], everywhere: bool) -> str:
     goal = mode.get("goal") if mode.get("goal") in MODE_GOALS else "balanced"
+    where = "in every project" if everywhere else "for this project"
     parts = [
-        "Alethe orchestration is on for this project, so the user does not need to call it again.",
+        f"Alethe orchestration is on {where}, so the user does not need to call it.",
         f"Goal: {goal}, {MODE_GOALS[goal]}.",
     ]
     if mode.get("care") == "careful":
@@ -2384,7 +2429,7 @@ def mode_reminder(mode: Dict[str, Any]) -> str:
     parts.append(
         "Follow the alethe-orchestrate skill for each request: do it yourself when that is cheaper, "
         "delegate bounded units when it pays, and leave any other skill or spec workflow in charge of "
-        "its own steps. '/alethe off' turns this off."
+        "its own steps. '/alethe off' turns this off here."
     )
     return " ".join(parts)
 
@@ -2393,18 +2438,15 @@ def hook_output(stdin_text: str) -> str:
     try:
         event = json.loads(stdin_text) if stdin_text.strip() else {}
         cwd = Path(event.get("cwd") or os.getcwd()) if isinstance(event, dict) else Path(os.getcwd())
-        here = cwd.expanduser().resolve()
         now = time.time()
-        modes = live_modes(now)
-        matches = [scope for scope in modes if here == Path(scope) or is_inside(here, Path(scope))]
-        if not matches:
+        state = read_mode_state(now)
+        scope, mode = effective_mode(state, cwd.expanduser().resolve())
+        if mode is None:
             return ""
-        scope = max(matches, key=len)
-        mode = modes[scope]
-        if now - float(number(mode.get("seenAt")) or 0) > MODE_REFRESH_SECONDS:
+        if scope is not None and now - float(number(mode.get("seenAt")) or 0) > MODE_REFRESH_SECONDS:
             mode["seenAt"] = now
-            save_modes(modes)
-        return mode_reminder(mode) + "\n"
+            save_mode_state(state)
+        return mode_reminder(mode, scope is None) + "\n"
     except Exception:  # A hook must never block the user's prompt.
         return ""
 
@@ -3743,6 +3785,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     mode_parser.add_argument("--rule", action="append", default=[], help="a standing instruction, in the user's words")
     mode_parser.add_argument("--clear-rules", action="store_true")
     mode_parser.add_argument("--cwd", type=Path, default=Path("."))
+    mode_parser.add_argument(
+        "--everywhere", action="store_true", help="the default for every project; mode off still turns it off in one"
+    )
     subparsers.add_parser("hook", help="print the reminder for an agent hook while a mode is on; never fails")
     budget_parser = subparsers.add_parser(
         "budget", help="show or set the limits for every wave in an orchestration folder"
@@ -3840,7 +3885,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.command == "mode":
             if args.action != "on" and (args.goal or args.care or args.rule or args.clear_rules):
                 raise PlanError("--goal, --care and --rule go with mode on")
-            payload = mode_payload(args.action, args.cwd, args.goal, args.care, args.rule, args.clear_rules)
+            payload = mode_payload(
+                args.action, args.cwd, args.goal, args.care, args.rule, args.clear_rules, args.everywhere
+            )
             print(json.dumps(payload, indent=2, ensure_ascii=False))
             return 0
         if args.command == "hook":
