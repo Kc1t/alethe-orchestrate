@@ -6,8 +6,8 @@
     "name": "Kauã Miguel",
     "url": "https://github.com/Kc1t"
   },
-  "homepage": "https://github.com/Kc1t/alethe-orchestrate",
-  "repository": "https://github.com/Kc1t/alethe-orchestrate",
+  "homepage": "https://github.com/Kc1t/alethe-orchestrate-skill",
+  "repository": "https://github.com/Kc1t/alethe-orchestrate-skill",
   "license": "MIT",
   "skills": "./skills/",
   "interface": {

@@ -2,8 +2,8 @@
   "name": "alethe-orchestrate",
   "description": "Plan with your agent and hand bounded work to Codex, Claude Code, Antigravity, Kimi or any CLI agent, following playbooks that save context and quota, then report what each run did and cost.",
   "author": { "name": "Kauã Miguel" },
-  "homepage": "https://github.com/Kc1t/alethe-orchestrate",
-  "repository": "https://github.com/Kc1t/alethe-orchestrate",
+  "homepage": "https://github.com/Kc1t/alethe-orchestrate-skill",
+  "repository": "https://github.com/Kc1t/alethe-orchestrate-skill",
   "license": "MIT",
   "keywords": ["orchestration", "agents", "codex", "claude-code", "antigravity", "kimi", "skills"]
 }

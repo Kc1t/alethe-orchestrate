@@ -2,7 +2,7 @@
 
 <br />
 <div align="center">
-  <a href="https://github.com/Kc1t/alethe-orchestrate">
+  <a href="https://github.com/Kc1t/alethe-orchestrate-skill">
     <img src="./docs/assets/alethe.png" alt="Alethe logo" width="120">
   </a>
 
@@ -17,7 +17,7 @@
   </p>
 
   <p align="center">
-    <a href="https://github.com/Kc1t/alethe-orchestrate/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/Kc1t/alethe-orchestrate/actions/workflows/ci.yml/badge.svg"></a>
+    <a href="https://github.com/Kc1t/alethe-orchestrate-skill/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/Kc1t/alethe-orchestrate-skill/actions/workflows/ci.yml/badge.svg"></a>
     <a href="./CHANGELOG.md"><img alt="Skill version" src="https://img.shields.io/badge/skill-v15-4f46e5?style=flat-square"></a>
     <a href="./LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square"></a>
     <img alt="Python 3.9+ optional" src="https://img.shields.io/badge/python-3.9%2B%20optional-3776ab?style=flat-square&logo=python&logoColor=white">
@@ -36,9 +36,9 @@
     ·
     <a href="#commands">Commands</a>
     ·
-    <a href="https://github.com/Kc1t/alethe-orchestrate/issues/new?labels=bug">Report Bug</a>
+    <a href="https://github.com/Kc1t/alethe-orchestrate-skill/issues/new?labels=bug">Report Bug</a>
     ·
-    <a href="https://github.com/Kc1t/alethe-orchestrate/issues/new?labels=enhancement">Request Feature</a>
+    <a href="https://github.com/Kc1t/alethe-orchestrate-skill/issues/new?labels=enhancement">Request Feature</a>
     ·
     <a href="https://github.com/Kc1t/alethe-agents">Alethe</a>
   </p>
@@ -353,20 +353,20 @@ is given, so `/alethe report` is all it takes.
 **Any agent** (Claude Code, Codex, Cursor, Gemini CLI, Antigravity and others):
 
 ```sh
-npx skills add Kc1t/alethe-orchestrate
+npx skills add Kc1t/alethe-orchestrate-skill
 ```
 
 **Claude Code plugin:**
 
 ```text
-/plugin marketplace add Kc1t/alethe-orchestrate
+/plugin marketplace add Kc1t/alethe-orchestrate-skill
 /plugin install alethe-orchestrate@alethe
 ```
 
 **Codex plugin:**
 
 ```sh
-codex plugin marketplace add Kc1t/alethe-orchestrate
+codex plugin marketplace add Kc1t/alethe-orchestrate-skill
 codex plugin add alethe-orchestrate@alethe
 ```
 
@@ -536,7 +536,7 @@ their owners; the skill uses the marks only to label each provider.
 
 ## Community
 
-- Bugs and feature requests: <https://github.com/Kc1t/alethe-orchestrate/issues>
+- Bugs and feature requests: <https://github.com/Kc1t/alethe-orchestrate-skill/issues>
 - Changelog: [`CHANGELOG.md`](CHANGELOG.md)
 - Alethe, the desktop workspace this skill comes from: <https://github.com/Kc1t/alethe-agents>
 - Maintainer: [Kc1t](https://github.com/Kc1t)
