@@ -44,10 +44,6 @@
   </p>
 </div>
 
-> [!NOTE]
-> This repository is private for now. Installing needs access to it and git credentials on your
-> machine: on GitHub, `gh auth login` followed by `gh auth setup-git` stores them.
-
 ## What It Is
 
 Handing a task to a second agent is easy. Knowing whether it paid off is the actual job. Every
