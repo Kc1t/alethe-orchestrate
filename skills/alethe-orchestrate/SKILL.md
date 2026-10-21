@@ -1,8 +1,8 @@
 ---
 name: alethe-orchestrate
-description: Orchestrate bounded Codex, Claude Code, Agy, Kimi, or custom CLI workers to finish work with the least lead context and provider usage, following strategy playbooks such as plan big, execute small. Use when the user asks to orchestrate, delegate, compare agents, conserve agent tokens or quota, recover a worker, report what an orchestration did and cost, or work without MCP, when the user types /alethe or a short command such as "alethe report" or "alethe stop", and when they want it on from now on, at any point of a task and alongside other skills. Do not use for a small mechanical task unless explicitly requested.
+description: Orchestrate bounded Codex, Claude Code, Agy, Kimi, or custom CLI workers to finish work with the least lead context and provider usage, following strategy playbooks such as plan big, execute small. Use when the user asks to orchestrate, delegate, compare agents, conserve agent tokens or quota, recover a worker, report what an orchestration did and cost, or work without MCP or Python, when the user types /alethe or a short command such as "alethe report" or "alethe stop", and when they want it on from now on, at any point of a task and alongside other skills. Do not use for a small mechanical task unless explicitly requested.
 metadata:
-  version: "13"
+  version: "14"
 ---
 
 # Orchestrate CLI workers
@@ -16,6 +16,12 @@ transcripts outside your context, and integrate only results supported by eviden
 Honor an explicit request for the local skill or no MCP. It always wins. Otherwise run
 `scripts/orchestrate.py policy show` and use its `backend`: `skill` selects this runner, `mcp`
 selects `alethe_*` tools when present, and `auto` prefers those tools when available.
+
+Python is optional. When `python --version`, `python3 --version` and `py --version` all fail or
+report below 3.9, or the user asks not to depend on Python, follow
+[references/manual.md](references/manual.md): you detect the CLIs yourself, offer the user two to
+four options, launch the workers from your own shell and write the report. Every other section of
+this file still applies; read each `scripts/orchestrate.py` step as its manual equivalent there.
 
 The skill path is self-contained and never requires MCP. Its runner provides strategies, provider
 switching preferences, concurrent processes, deadlines, structured outcomes, selective worktree

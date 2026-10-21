@@ -3,6 +3,15 @@
 The version is the integer in `skills/alethe-orchestrate/SKILL.md` under `metadata.version`.
 Alethe installs and updates the skill by that number.
 
+## 14 (2026-10-21)
+
+Added:
+
+- Python is optional. Without it, or when the user asks, the lead follows `references/manual.md`:
+  it detects the CLIs, offers two to four options, starts the workers from its own shell with the
+  same flags the runner uses, and writes `report.md` from what each CLI reported. Limits are
+  counted by the lead after each wave instead of enforced, and the preview diagram is Mermaid.
+
 ## 13 (2026-10-19)
 
 Added:

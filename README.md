@@ -18,9 +18,9 @@
 
   <p align="center">
     <a href="https://github.com/Kc1t/alethe-orchestrate/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/Kc1t/alethe-orchestrate/actions/workflows/ci.yml/badge.svg"></a>
-    <a href="./CHANGELOG.md"><img alt="Skill version" src="https://img.shields.io/badge/skill-v13-4f46e5?style=flat-square"></a>
+    <a href="./CHANGELOG.md"><img alt="Skill version" src="https://img.shields.io/badge/skill-v14-4f46e5?style=flat-square"></a>
     <a href="./LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square"></a>
-    <img alt="Python 3.9+" src="https://img.shields.io/badge/python-3.9%2B-3776ab?style=flat-square&logo=python&logoColor=white">
+    <img alt="Python 3.9+ optional" src="https://img.shields.io/badge/python-3.9%2B%20optional-3776ab?style=flat-square&logo=python&logoColor=white">
     <img alt="Windows, macOS and Linux" src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-555?style=flat-square">
     <a href="https://agentskills.io"><img alt="Agent Skill" src="https://img.shields.io/badge/Agent%20Skill-SKILL.md-111?style=flat-square"></a>
   </p>
@@ -60,9 +60,11 @@ small runner starts the workers, enforces the limits and writes down what happen
 is done, `report` tells you what each worker did, why, and what its CLI said it cost.
 
 It is a plain [Agent Skill](https://agentskills.io): a `SKILL.md`, a few references loaded on
-demand, and one Python script with no dependencies. It needs Python 3.9 or newer and at least one
-agent CLI. It works on its own; inside [Alethe](https://github.com/Kc1t/alethe-agents) it can also
-put workers on Alethe's orchestration board.
+demand, and one Python script with no dependencies. It needs at least one agent CLI. Python 3.9
+or newer is optional: without it, your agent detects the CLIs, offers you the options, starts the
+workers from its own shell and writes the report itself, with soft limits instead of enforced
+ones. It works on its own; inside [Alethe](https://github.com/Kc1t/alethe-agents) it can also put
+workers on Alethe's orchestration board.
 
 ## Why It's Different
 
