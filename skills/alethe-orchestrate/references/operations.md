@@ -18,12 +18,18 @@ python scripts/orchestrate.py dry-run <plan.json>
 python scripts/orchestrate.py dry-run <plan.json> --write <preview.json>
 python scripts/orchestrate.py run <plan.json>
 python scripts/orchestrate.py run <plan.json> --strategy economy
+python scripts/orchestrate.py new "Rename the login helper" --playbook scout-then-build --why "..."
+python scripts/orchestrate.py run <plan.json> --in current
 python scripts/orchestrate.py run <plan.json> --run-dir <folder>/01-explore
-python scripts/orchestrate.py budget <folder> --max-calls 8 --max-reported-cost-usd 2
-python scripts/orchestrate.py status <folder>
-python scripts/orchestrate.py mark <folder>/02-build <worker> used --why "merged as is"
-python scripts/orchestrate.py report <folder>
+python scripts/orchestrate.py budget --max-calls 8 --max-reported-cost-usd 2
+python scripts/orchestrate.py note "review: the diff was three lines" --kind skip
+python scripts/orchestrate.py status
+python scripts/orchestrate.py stop
+python scripts/orchestrate.py mark <worker> used --why "merged as is"
+python scripts/orchestrate.py report
 python scripts/orchestrate.py report <folder> --format json --write <report.json>
+python scripts/orchestrate.py list
+python scripts/orchestrate.py use <folder>
 ```
 
 `doctor` checks the environment before you promise anything: Python version, installed provider
@@ -47,10 +53,45 @@ with briefs so short that each worker's startup costs more than the work, Kimi r
 brief that mentions MCP while servers are off, and a writer in a checkout that already has
 uncommitted changes. Fix them or say why they do not apply.
 
-Pass `--run-dir <empty-directory>` when a stable output location is useful. Otherwise the runner
-creates a unique directory under the operating system's temporary directory. For an orchestration
-with several waves, give each wave its own folder inside one parent, such as
-`<folder>/01-explore` and `<folder>/02-build`, so `report` can read them together.
+## The current orchestration
+
+`new "<title>"` creates an orchestration folder under `orchestrations/` next to the saved policy
+(`ALETHE_ORCHESTRATE_HOME` overrides it), saves the title, playbook and why in
+`orchestration.json`, and makes it current. `run <plan> --in current` adds the next wave as
+`<NN>-<phase>`, so `report` reads every wave together.
+
+`report`, `status`, `budget`, `note`, `stop` and `mark` act on the current orchestration when no
+folder is given. The current one is the folder `new` created, the one `use <folder>` picked, or
+the last folder a `run` wrote to: the parent of `--run-dir`, or the run itself when the runner
+picked a temporary directory. `list` shows recent orchestrations with their waves and spend, and
+marks the current one with `*`.
+
+`--run-dir <empty-directory>` still works when a fixed location is useful; give each wave its own
+folder inside one parent, such as `<folder>/01-explore` and `<folder>/02-build`. Without either
+flag the runner creates a unique directory under the operating system's temporary directory.
+
+## Staying on
+
+`mode on [--goal save|balanced|max] [--care careful] [--rule TEXT]... [--cwd DIR]` keeps
+orchestration on for the repository that holds `--cwd` (or that folder outside git), saved in
+`modes.json` next to the orchestrations. Calling it again changes only the flags given; rules add
+up to 8, and `--clear-rules` drops them. `mode show` prints the mode, and `mode off` removes it. A
+mode with no prompt for 12 hours is dropped.
+
+`hook` reads an agent hook's JSON from stdin and prints a one-paragraph reminder of the goal, care
+level and rules when the hook's `cwd` is inside a project with a mode on, and nothing otherwise.
+It never fails. The Claude Code plugin runs it on every prompt (`hooks/hooks.json`).
+
+## Changing course
+
+`note "<text>" [--kind change|skip|add|switch|lead]` appends a line to `journal.jsonl` in the
+orchestration folder. The report lists them under "Changes to the plan" with the time, and
+`status` shows the count and the latest one. Record a skipped or added phase, a switched playbook,
+a move to freeform waves, or a step the lead did itself, with the reason.
+
+`stop` writes a `stop` file into every running wave of the orchestration. Each running worker's
+process tree ends within a few seconds with status `stopped`, workers still queued are skipped
+with `failureKind: stopped`, and the wave ends as `stopped`. Results that finished before stay.
 
 If Python is unavailable, do not install it without permission. Use the command shapes in
 `references/providers.md` with the host's native background-process facility and reproduce the
@@ -148,11 +189,11 @@ in-flight work.
 
 ## Orchestration budget
 
-A plan's budget covers one wave. `budget <folder>` sets limits for every wave run with
-`--run-dir <folder>/<NN>-<phase>`: `--max-calls`, `--max-reported-cost-usd` and
+A plan's budget covers one wave. `budget [folder]` sets limits for every wave of an
+orchestration: `--max-calls`, `--max-reported-cost-usd` and
 `--max-reported-tokens`. It saves them in `<folder>/budget.json`. Each run adds up what the earlier
 waves in that folder used and refuses to start once a limit is spent; a wave that reaches a limit
-part way stops starting workers. `budget <folder>` without limits shows them with the usage so far
+part way stops starting workers. `budget` without limits shows them with the usage so far
 and what remains, and `--clear` removes them. Waves are counted after they finish, so run one wave
 at a time in a folder.
 
@@ -243,13 +284,13 @@ context" compares the transcripts that stayed on disk with the results the lead 
 FAIL or NOT_PROVEN verdict, wrote while read-only, or had tool calls denied, each with what to do
 next. With a folder budget, the report adds what every wave used against it.
 
-`mark <run> <worker> used|partial|discarded [--why TEXT]` records whether you kept a worker's
+`mark [folder] <worker> used|partial|discarded [--why TEXT]` records whether you kept a worker's
 result. Once any result is marked, the report adds a **Value** line that splits the reported cost
 and tokens between results used, partly used and discarded, and lists the ones still unmarked.
 That is how an orchestration shows what its spend bought.
 
-`status <folder>` prints a few lines: the waves and how they ended, what was spent, the folder
-budget, what needs attention, open worktrees and unmarked results. Run it first after the
+`status [folder]` prints a few lines: the waves and how they ended, what was spent, the changes
+to the plan, the folder budget, what needs attention, open worktrees and unmarked results. Run it first after the
 conversation is compacted or in a new session, instead of reading the runs again.
 
 ## Worktrees and dirty state

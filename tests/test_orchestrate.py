@@ -10,6 +10,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -46,6 +47,10 @@ class Fixtures(unittest.TestCase):
         self.root = Path(tempfile.mkdtemp(prefix="orchestrate-test-"))
         self.addCleanup(remove_tree, self.root)
         self.policy = self.root / "policy.json"
+        self.home = self.root / "home"
+        patcher = mock.patch.dict(os.environ, {"ALETHE_ORCHESTRATE_HOME": str(self.home)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def call(self, *args):
         out, err = io.StringIO(), io.StringIO()
@@ -484,6 +489,115 @@ class GuardTest(Fixtures):
         self.assertLessEqual(len(status), 8)
         self.assertEqual(status[1], "Waves: 1. explore partial (1/3); 2. build done (2/2)")
         self.assertTrue(any(line.startswith("Not marked: ") for line in status))
+
+    def test_the_current_orchestration_needs_no_folder_and_records_plan_changes(self):
+        code, out, err = self.call("new", "Revisão do login", "--playbook", "plan-big-execute-small", "--why", "Fix the login flow.")
+        self.assertEqual(code, 0, err)
+        folder = Path(json.loads(out)["folder"])
+        self.assertTrue(folder.name.endswith("-revisao-do-login"))
+        self.assertIn("no waves yet", self.call("report")[2])
+
+        scout = self.write_plan("scout", {"version": 1, "phase": "scout", "workers": [self.worker("map", "read-only", ["say", "Mapped."], "text", self.root)]})
+        fix = self.write_plan("fix", {"version": 1, "phase": "Fix_It", "workers": [self.worker("patch", "read-only", ["say", "Patched."], "text", self.root)]})
+        self.assertEqual(self.call("run", scout, "--in", "current", "--policy", self.policy)[0], 0)
+        self.assertEqual(self.call("note", "the review phase, the diff was three lines", "--kind", "skip")[0], 0)
+        self.assertEqual(self.call("note", "to freeform: the bug was in the build script", "--kind", "switch")[0], 0)
+        self.assertEqual(self.call("run", fix, "--in", "current", "--policy", self.policy)[0], 0)
+        self.assertEqual(sorted(path.name for path in folder.iterdir() if path.is_dir()), ["01-scout", "02-fix-it"])
+        self.assertEqual(self.call("run", fix, "--in", "current", "--run-dir", self.root / "x", "--policy", self.policy)[0], 2)
+
+        self.assertEqual(self.call("mark", "map", "used")[0], 0)
+        markdown = self.call("report")[1]
+        self.assertIn("**Revisão do login**, playbook `plan-big-execute-small`, 2 waves", markdown)
+        self.assertIn("Why: Fix the login flow.", markdown)
+        self.assertIn("## Changes to the plan", markdown)
+        self.assertRegex(markdown, r"- \d\d:\d\d Skipped: the review phase, the diff was three lines")
+        self.assertIn("Switched: to freeform: the bug was in the build script", markdown)
+        self.assertIn("Marked used", markdown)
+        status = self.call("status")[1]
+        self.assertIn("Plan changes: 2, last: switched to freeform", status)
+
+        listing = self.call("list")[1].splitlines()
+        self.assertTrue(listing[0].startswith("* "), listing)
+        self.assertIn("Revisão do login | playbook plan-big-execute-small | 2 waves, done", listing[0])
+        self.assertIn("2 plan changes", listing[0])
+
+        other = self.root / "other"
+        self.assertEqual(self.run_plan("other", [self.worker("solo", "read-only", ["say", "Solo."], "text", self.root)], run_dir=other / "01-a")[0], 0)
+        self.assertEqual(json.loads(self.call("report", "--format", "json")[1])["totals"]["workers"], 1)
+        self.assertEqual(self.call("use", folder)[0], 0)
+        self.assertEqual(json.loads(self.call("report", "--format", "json")[1])["totals"]["workers"], 2)
+
+    def hook(self, cwd):
+        with mock.patch.object(sys, "stdin", io.StringIO(json.dumps({"cwd": str(cwd), "prompt": "next"}))):
+            return self.call("hook")[1]
+
+    def test_a_mode_stays_on_for_the_project_and_reminds_every_prompt(self):
+        repo = self.make_repo()
+        (repo / "src").mkdir()
+        self.assertEqual(self.hook(repo), "")
+        code, out, err = self.call("mode", "on", "--cwd", repo / "src", "--care", "careful", "--rule", "a partir de agora preciso ir com cuidado")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(Path(json.loads(out)["scope"]), repo.resolve())
+        self.call("mode", "on", "--cwd", repo, "--goal", "save")
+
+        reminder = self.hook(repo / "src")
+        self.assertIn("Alethe orchestration is on for this project", reminder)
+        self.assertIn("Goal: save", reminder)
+        self.assertIn("Careful: read before writing", reminder)
+        self.assertIn("User rules: a partir de agora preciso ir com cuidado.", reminder)
+        self.assertEqual(self.hook(self.root), "")
+        with mock.patch.object(sys, "stdin", io.StringIO("not json")):
+            self.assertEqual(self.call("hook")[:2], (0, ""))
+
+        with mock.patch.object(orchestrate.time, "time", return_value=time.time() + orchestrate.MODE_IDLE_SECONDS + 1):
+            self.assertEqual(self.hook(repo), "")
+        self.assertEqual(self.call("mode", "on", "--cwd", repo, "--clear-rules")[0], 0)
+        self.assertNotIn("User rules", self.hook(repo))
+        self.assertEqual(self.call("mode", "off", "--goal", "max", "--cwd", repo)[0], 2)
+        self.assertEqual(json.loads(self.call("mode", "off", "--cwd", repo)[1])["on"], False)
+        self.assertEqual(self.hook(repo), "")
+
+    def test_the_plugin_hook_and_command_point_at_the_runner(self):
+        hooks = json.loads((ROOT / "hooks" / "hooks.json").read_text(encoding="utf-8"))
+        command = hooks["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+        self.assertIn("${CLAUDE_PLUGIN_ROOT}/skills/alethe-orchestrate/scripts/orchestrate.py\" hook", command)
+        alethe = (ROOT / "commands" / "alethe.md").read_text(encoding="utf-8")
+        self.assertIn("$ARGUMENTS", alethe)
+        self.assertIn('"Short commands"', alethe)
+        self.assertIn("## Short commands", (SKILL / "SKILL.md").read_text(encoding="utf-8"))
+
+    def test_stop_ends_the_running_worker_and_skips_the_queued_one(self):
+        workers = [
+            self.worker("slow", "read-only", ["sleep", "60"], "text", self.root),
+            self.worker("next", "read-only", ["say", "Later."], "text", self.root),
+        ]
+        plan = self.write_plan("slow", {"version": 1, "maxConcurrent": 1, "workers": workers})
+        folder = self.root / "orchestration"
+        run_dir = folder / "01-slow"
+        process = subprocess.Popen(
+            [sys.executable, str(SCRIPT), "run", str(plan), "--run-dir", str(run_dir), "--policy", str(self.policy)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.addCleanup(process.kill)
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            state = orchestrate.read_optional_json(run_dir / "state.json")
+            if isinstance(state, dict) and state["workers"]["slow"]["status"] == "running":
+                break
+            time.sleep(0.2)
+        code, out, err = self.call("stop", folder)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["stopping"], [str(run_dir)])
+        _, stderr = process.communicate(timeout=30)
+        self.assertEqual(process.returncode, 1, stderr)
+        state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["status"], "stopped")
+        self.assertEqual(state["workers"]["slow"]["status"], "stopped")
+        self.assertLess(state["workers"]["slow"]["durationSeconds"], 30)
+        self.assertEqual((state["workers"]["next"]["status"], state["workers"]["next"]["failureKind"]), ("skipped", "stopped"))
+        self.assertEqual(json.loads(self.call("stop", folder)[1])["stopping"], [])
 
     def test_previews_warn_before_money_is_spent(self):
         repo = self.make_repo()

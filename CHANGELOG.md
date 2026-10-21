@@ -3,6 +3,31 @@
 The version is the integer in `skills/alethe-orchestrate/SKILL.md` under `metadata.version`.
 Alethe installs and updates the skill by that number.
 
+## 13 (2026-10-19)
+
+Added:
+
+- `/alethe` in Claude Code, and short commands after the skill's name elsewhere: `report`,
+  `status`, `list`, `stop`, `skip`, `switch`, `freeform`, `budget`, `mark`, `setup` and `help`.
+- `new "<title>"` starts an orchestration folder and makes it current, and `run --in current`
+  adds the next wave. `report`, `status`, `budget`, `note`, `stop` and `mark` then need no folder,
+  and `mark` needs no run.
+- `list` shows recent orchestrations with their waves and spend, and `use` makes one current again.
+- `stop` ends the running workers of an orchestration and skips the queued ones.
+- `note` records a change to the plan. The report lists them under "Changes to the plan" and
+  `status` shows the latest.
+- `mode on` keeps orchestration on for a project with a goal (`save`, `balanced`, `max`), an
+  optional `careful` level and the user's standing rules, until `mode off` or 12 idle hours. The
+  Claude Code plugin's prompt hook reminds the agent while it is on, so the user calls the skill
+  once.
+- The skill joins mid-task and inside other workflows such as spec-driven development, taking the
+  work so far as its plan, and runs with the CLIs it finds when nothing is configured yet.
+
+Changed:
+
+- Playbooks are where the lead starts, not a contract. Between waves it can skip, repeat or add a
+  phase, do a step itself, switch playbooks or go freeform, and the user can ask for any of these.
+
 ## 12 (2026-10-19)
 
 Fixed:

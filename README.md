@@ -18,7 +18,7 @@
 
   <p align="center">
     <a href="https://github.com/Kc1t/alethe-orchestrate/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/Kc1t/alethe-orchestrate/actions/workflows/ci.yml/badge.svg"></a>
-    <a href="./CHANGELOG.md"><img alt="Skill version" src="https://img.shields.io/badge/skill-v12-4f46e5?style=flat-square"></a>
+    <a href="./CHANGELOG.md"><img alt="Skill version" src="https://img.shields.io/badge/skill-v13-4f46e5?style=flat-square"></a>
     <a href="./LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square"></a>
     <img alt="Python 3.9+" src="https://img.shields.io/badge/python-3.9%2B-3776ab?style=flat-square&logo=python&logoColor=white">
     <img alt="Windows, macOS and Linux" src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-555?style=flat-square">
@@ -29,6 +29,8 @@
     <a href="#install">Install</a>
     ·
     <a href="#how-it-works">How it works</a>
+    ·
+    <a href="#call-it-once-at-any-point">Call it once</a>
     ·
     <a href="#the-report">The report</a>
     ·
@@ -82,7 +84,15 @@ put workers on Alethe's orchestration board.
 - **Quota-aware, Windows included.** Work moves to the next provider when one runs low, as Alethe
   reports or you say, and workers run headless without tmux on Windows, macOS and Linux.
 - **Easy to audit.** Python's standard library only, no network access (a test fails if the runner
-  imports a networking module), no hooks and no install scripts.
+  imports a networking module) and no install scripts. The plugin's one hook prints a short
+  reminder while you have orchestration on, and nothing otherwise.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./docs/assets/drawings/savings-dark.svg">
+    <img src="./docs/assets/drawings/savings-light.svg" alt="Two hand-drawn bar charts. Left: one Claude haiku worker on the same one-line task used 76,160 tokens and $0.16 with version 11, and 38,157 tokens and $0.08 with version 12. Right: in a real two-worker run, 5.0 KB of worker transcripts stayed on disk while the lead read 595 bytes of results" width="820">
+  </picture>
+</p>
 
 ## Agents
 
@@ -103,19 +113,12 @@ for the exact invocations.
 
 ## How It Works
 
-```mermaid
-flowchart TD
-    you([You]) -->|"orchestrate this"| pick["Lead picks a playbook"]
-    pick --> briefs["Lead writes the briefs<br/>plan.json"]
-    briefs --> preview{"dry-run<br/>warnings?"}
-    preview -->|"fix the plan"| briefs
-    preview -->|clean| wave["orchestrate.py<br/>starts a wave"]
-    wave --> codex["Codex"] & claude["Claude Code"] & agy["Antigravity"]
-    codex & claude & agy --> files[("outcome.json<br/>result.md · diff.patch")]
-    files --> check["Lead checks, integrates<br/>and marks each result"]
-    check -->|"next phase"| wave
-    check -->|done| report(["report: what it did,<br/>why, what it cost"])
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./docs/assets/drawings/how-it-works-dark.svg">
+    <img src="./docs/assets/drawings/how-it-works-light.svg" alt="You ask your agent to orchestrate a refactor. The lead agent picks a playbook, writes the briefs and dry-runs the plan, then orchestrate.py runs one wave of workers: Claude Code on haiku, read-only; Codex at low effort, writing in its own worktree; Antigravity, read-only. They leave result.md, diff.patch and outcome.json while full transcripts stay on disk. The lead reads only the results, checks, integrates and marks them, runs the next wave, and finally writes the orchestration report" width="900">
+  </picture>
+</p>
 
 1. **Plan.** The lead, which is your agent, picks one of eleven playbooks and splits the task into
    units. For each unit it writes a brief: the goal as checks that pass or fail, the paths it owns,
@@ -130,6 +133,30 @@ flowchart TD
 5. **Integrate.** The lead applies what holds up, runs the checks in the combined checkout, and
    marks each result `used`, `partial` or `discarded`.
 6. **Report.** `report` explains the whole orchestration, wave by wave.
+
+## Call It Once, at Any Point
+
+`/alethe on`, or any instruction that starts with "from now on", keeps orchestration on for the
+project. Every prompt after that carries a short reminder of your goal, care level and rules, and
+the lead decides per request whether to do the work itself or hand parts of it off.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./docs/assets/drawings/stay-on-dark.svg">
+    <img src="./docs/assets/drawings/stay-on-light.svg" alt="A conversation. The first message says /alethe from now on, be careful with the database, and the lead turns the mode on with careful and keeps the words as a rule. The next messages need no /alethe: a hook reminds the lead of the goal, care and rules each time. It fixes a typo itself because it is too small to hand off, orchestrates moving 40 endpoints with cheap scouts and writers in worktrees, and answers how is it going with a short status. It stays on for the project until /alethe off or 12 hours without a prompt" width="820">
+  </picture>
+</p>
+
+It joins wherever you are, including halfway through another skill's workflow. Nothing restarts:
+the spec, the task list and the diff so far become the plan, and the other workflow keeps its own
+steps and gates.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./docs/assets/drawings/mid-task-dark.svg">
+    <img src="./docs/assets/drawings/mid-task-light.svg" alt="A tasks.md from a spec-driven workflow with tasks 1 to 3 done. /alethe joins at task 4. The lead takes the spec and the diff so far as the plan and sends tasks 4 and 5 out: four Codex writers with one worktree per group, two Claude haiku workers fixing the tests, and the coupled part stays with the lead. Task 6, the review gate, stays with the original workflow, whose checks become the gates" width="860">
+  </picture>
+</p>
 
 ## Inside a Wave
 
@@ -202,6 +229,18 @@ flowchart TD
     checks -->|yes| next(["review-gate"])
 ```
 
+A playbook is where the lead starts, not a contract. Between waves it can skip or repeat a phase,
+add one, do a step itself, switch playbooks or go freeform, and you can ask for any of that at any
+time. Each change goes into the orchestration's journal with its reason, and the report lists it
+under "Changes to the plan".
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./docs/assets/drawings/change-course-dark.svg">
+    <img src="./docs/assets/drawings/change-course-light.svg" alt="Top row, dashed: the scout-then-build playbook, scout, plan, build, review. Bottom row, what ran: scout, plan, a freeform wave to fix the build script because the bug was there, build, and review crossed out because the diff was three lines. The journal.jsonl records each change with its reason, and the report shows them under Changes to the plan" width="820">
+  </picture>
+</p>
+
 The playbooks live in one YAML file you can copy and edit with `playbook --init`.
 [`references/playbooks.md`](skills/alethe-orchestrate/references/playbooks.md) explains every
 field and condition.
@@ -241,7 +280,7 @@ expensive one.
 | Limit | Set with | Covers | Enforced by |
 |---|---|---|---|
 | Calls, wall time, prompt size, reported cost, reported tokens | The plan's `budget` | One wave | The runner, before each worker starts |
-| Calls, reported cost, reported tokens | `budget <folder>` | Every wave in the folder | The runner, adding up the earlier waves |
+| Calls, reported cost, reported tokens | `budget [folder]` | Every wave of the orchestration | The runner, adding up the earlier waves |
 | Reported cost | Automatic, from the limits above | One Claude worker | Claude Code, through `--max-budget-usd` |
 | Defaults for any of the above | `policy set` | Every plan | The runner |
 
@@ -305,8 +344,9 @@ at API prices, so on a subscription that work counted against your plan's limits
 - shows budget stops, the orchestration budget, changed files, worktrees to review and sessions
   you can resume.
 
-`--format json` returns the same data, and `status <folder>` prints a few lines to pick an
-orchestration up again after the conversation was compacted.
+`--format json` returns the same data, and `status` prints a few lines to pick an orchestration
+up again after the conversation was compacted. Both read the current orchestration when no folder
+is given, so `/alethe report` is all it takes.
 
 ## Install
 
@@ -336,6 +376,26 @@ codex plugin add alethe-orchestrate@alethe
 Then ask your agent to set up orchestration, and after that, ask in plain words: "orchestrate this
 refactor", "use savings for now", "what did that run cost?".
 
+In Claude Code the plugin adds `/alethe`. Elsewhere, write the same words after the skill's name.
+
+| Type | It does |
+| --- | --- |
+| `/alethe <task>` | Orchestrates the task |
+| `/alethe on`, `save`, `max`, `careful` | Keeps it on for this project, with that goal or care level |
+| `/alethe from now on <instruction>` | Keeps it on and keeps your instruction as a standing rule |
+| `/alethe off` | Turns it off |
+| `/alethe report` | The full report of the current orchestration |
+| `/alethe status` | Where it stands, in a few lines |
+| `/alethe list` | Recent orchestrations, with their waves and spend |
+| `/alethe stop` | Stops the running workers and skips the queued ones |
+| `/alethe skip <phase>`, `switch <playbook>`, `freeform` | Changes course and records why |
+| `/alethe budget <limit>` | Caps calls, reported cost or tokens for every wave |
+| `/alethe mark <worker> used` | Records what a result was worth |
+| `/alethe setup` | Checks the CLIs and walks through the first configuration |
+
+You call it once; see [Call It Once, at Any Point](#call-it-once-at-any-point). With nothing
+configured yet, it uses the CLIs it finds for the task at hand and offers the full setup afterwards.
+
 ## Commands
 
 All commands live in `skills/alethe-orchestrate/scripts/orchestrate.py`; your agent runs them for
@@ -350,11 +410,16 @@ you.
 | Plan | `scaffold <strategy>` | Prints a starter plan |
 | Plan | `validate <plan>` | Checks a plan without running it |
 | Plan | `dry-run <plan>` | Explains the strategy, providers, models and budget, with warnings |
-| Run | `budget <folder>` | Shows or sets limits that cover every wave in an orchestration folder |
-| Run | `run <plan>` | Runs one wave and writes its results to a run folder |
+| Setup | `mode on\|off\|show` | Keeps orchestration on for a project, with `--goal`, `--care` and `--rule` |
+| Run | `new <title>` | Starts an orchestration folder and makes it current |
+| Run | `budget [folder]` | Shows or sets limits that cover every wave in an orchestration |
+| Run | `run <plan> --in current` | Runs one wave as the next step of the current orchestration |
+| Run | `note <text>` | Records a change to the plan: a skipped phase, a switched playbook, a step the lead did |
+| Run | `stop [folder]` | Stops the running waves; queued workers are skipped |
 | After | `status [folder]` | Prints where an orchestration stands in a few lines |
-| After | `mark <run> <worker> used\|partial\|discarded` | Records whether a result was kept, for the value line |
-| After | `report [folder]` | Explains what the runs did, why, and what they reported spending |
+| After | `mark [folder] <worker> used\|partial\|discarded` | Records whether a result was kept, for the value line |
+| After | `report [folder]` | Explains what the runs did, why, what changed in the plan, and what they reported spending |
+| After | `list`, `use <folder>` | Lists recent orchestrations; makes one current again |
 
 `scripts/diagram.py` renders a dry-run as an SVG architecture preview.
 
@@ -364,8 +429,10 @@ you.
 | --- | --- |
 | Policy | `%APPDATA%\Alethe\alethe-orchestrate.json` on Windows, `~/.config/alethe/orchestrate.json` elsewhere. `ALETHE_ORCHESTRATE_POLICY` overrides it |
 | Your playbooks and profiles | `alethe-playbooks.yaml` next to the policy. `ALETHE_ORCHESTRATE_PLAYBOOKS` overrides it |
-| Runs | The temporary directory, or the folder given with `--run-dir` |
-| Orchestration limits | `budget.json` in the orchestration folder, written by `budget` |
+| Orchestrations | `orchestrations/` next to the policy, one folder per `new`, with a wave folder per run. `ALETHE_ORCHESTRATE_HOME` overrides it |
+| Single runs | The temporary directory, or the folder given with `--run-dir` |
+| Orchestration limits and plan changes | `budget.json` and `journal.jsonl` in the orchestration folder |
+| Modes that are on | `modes.json` in the orchestrations folder, per project |
 | Worktrees | `<repo>/.alethe/worktrees/`, kept until you remove them and excluded from `git status` |
 
 An orchestration folder holds one run per wave:
@@ -461,7 +528,8 @@ change it here, then run `npm run skill:sync -- --from <this checkout>` in the A
 
 ## License
 
-MIT, see [`LICENSE`](LICENSE). The license does not cover the **Alethe** name and logo, or the
+MIT, see [`LICENSE`](LICENSE). The drawings in `docs/assets/drawings/` are Excalidraw files,
+editable in [Excalidraw](https://excalidraw.com) or Obsidian. The license does not cover the **Alethe** name and logo, or the
 vendor marks in `docs/assets/` and `skills/alethe-orchestrate/assets/brands/`, which belong to
 their owners; the skill uses the marks only to label each provider.
 

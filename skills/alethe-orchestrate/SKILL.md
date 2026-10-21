@@ -1,14 +1,14 @@
 ---
 name: alethe-orchestrate
-description: Orchestrate bounded Codex, Claude Code, Agy, Kimi, or custom CLI workers to finish work with the least lead context and provider usage, following strategy playbooks such as plan big, execute small. Use when the user asks to orchestrate, delegate, compare agents, conserve agent tokens or quota, recover a worker, report what an orchestration did and cost, or work without MCP. Do not use for a small mechanical task unless explicitly requested.
+description: Orchestrate bounded Codex, Claude Code, Agy, Kimi, or custom CLI workers to finish work with the least lead context and provider usage, following strategy playbooks such as plan big, execute small. Use when the user asks to orchestrate, delegate, compare agents, conserve agent tokens or quota, recover a worker, report what an orchestration did and cost, or work without MCP, when the user types /alethe or a short command such as "alethe report" or "alethe stop", and when they want it on from now on, at any point of a task and alongside other skills. Do not use for a small mechanical task unless explicitly requested.
 metadata:
-  version: "12"
+  version: "13"
 ---
 
 # Orchestrate CLI workers
 
-The goal is to orchestrate and save: finish the work with the least lead context and the cheapest
-capable workers. Act as planner and integrator. Give each worker one bounded unit, keep detailed
+The goal is to get more out of the user's AI: finish the work with the least lead context and the
+cheapest capable workers, or, when they ask for the most, with the strongest mix they have. Act as planner and integrator. Give each worker one bounded unit, keep detailed
 transcripts outside your context, and integrate only results supported by evidence or diffs.
 
 ## Choose the backend
@@ -35,6 +35,11 @@ approval before saving them to the playbooks copy. Never persist a preference th
 confirm. Do not assume an unfamiliar tool is a worker: a
 proxy such as 9router belongs on the model traffic path, not in the worker list.
 
+Setup never blocks the work. When the user calls the skill mid-task with nothing configured, run
+`doctor`, use the logged-in CLIs it found with the bundled playbooks for this task, say so in one
+line, and keep going. Offer the full onboarding once the current step is done; save nothing
+until they agree.
+
 Translate loose configuration requests into actions:
 
 | The user says | Do |
@@ -43,14 +48,75 @@ Translate loose configuration requests into actions:
 | "use cheap models for the small stuff" | ask which provider and model, confirm, then `policy set --cheap-model provider=model` |
 | "at most N workers / T minutes / C dollars" as an ongoing preference | confirm, then `policy set --max-calls N --max-wall-seconds T --max-reported-cost-usd C` |
 | any of the above "for this run only" | put it in the plan's `budget` or use `--strategy`; never touch the policy |
-| "at most N calls / C dollars / T tokens for this whole task" | `budget <folder>` with those limits before the first wave |
-| "where were we", or after the conversation was compacted | `status <folder>` before anything else |
+| "at most N calls / C dollars / T tokens for this whole task" | `budget` with those limits before the first wave |
+| "where were we", or after the conversation was compacted | `status` before anything else |
 | "back to defaults" | confirm, then `policy reset` |
 | "change the playbooks" or roles per phase | `playbook --init`, then edit the copy it prints; the UI exports the same file |
 | "use savings" or "go aggressive" as an ongoing preference | confirm, then set `profile` in the playbooks copy |
-| "what did it do", "how much did it cost" | `report` on the orchestration folder; no confirmation needed |
+| "what did it do", "how much did it cost" | `report`; no confirmation needed |
 
-## Pick a playbook
+## Short commands
+
+`/alethe <args>` in Claude Code, or the same words after this skill's name anywhere else, map to
+one action. Commands without a folder act on the current orchestration: the one `new` started,
+`use` picked, or the last `run` wrote to.
+
+| Words | Do |
+| --- | --- |
+| a task, in plain words | orchestrate it as the rest of this skill describes |
+| nothing | `status`; with no current orchestration, list these commands in a few lines |
+| `on`, or a standing instruction ("from now on...", "a partir de agora...") | stay on, as below |
+| `off` | `mode off` |
+| `save`, `balanced`, `max` | `mode on --goal <it>` |
+| `careful` | `mode on --care careful` |
+| `report [folder]` | `report`, and show its output as is, without a summary of your own |
+| `status` | `status`, and show its output as is |
+| `list` | `list`; `use <folder>` makes one of them current again |
+| `stop` | `stop`, then `status` once the waves have ended |
+| `budget <limit>` | `budget --max-calls N`, `--max-reported-cost-usd C` or `--max-reported-tokens T` |
+| `skip <phase>`, `switch <playbook>`, `freeform`, `add <phase>` | change course as below |
+| `note <text>` | `note "<text>"` |
+| `mark <worker> used\|partial\|discarded` | `mark <worker> <mark>` |
+| `setup` | `doctor`, then onboarding when no policy is saved |
+| `help` | list these commands in a few lines |
+
+## Stay on
+
+The user should not have to call this skill on every message. `mode on` keeps it on for the
+current project (the repository root, or the folder) until `mode off`, or after 12 hours without
+a prompt:
+
+- `--goal save` spends as little as possible, `max` gets the most out of the available agents, and
+  `balanced` (the default) delegates only when the playbook says it pays.
+- `--care careful` reads before writing, isolates every writer, reviews every diff before
+  integrating it, and asks before anything hard to undo.
+- `--rule "<the user's words>"` keeps a standing instruction, up to 8; `--clear-rules` drops them.
+
+Turn it on when the user says `/alethe on`, gives a standing instruction, or asks for orchestration
+"from now on". Map the instruction to a goal or care level when one fits, and keep the user's own
+words as a rule. Confirm in one line what is now on, then go back to what they were doing.
+
+While it is on, the Claude Code plugin's hook reminds you on every prompt; without the plugin, run
+`mode show` after the conversation is compacted. Treat each request on its own: answer or do small
+work yourself, and orchestrate only the parts where delegation pays for its overhead under the
+goal. Nothing has to be orchestrated just because the mode is on.
+
+## Join mid-task
+
+The skill may be called at any point: at the start, halfway through a task, or inside another
+skill's workflow such as spec-driven development. Do not start over:
+
+1. Take what already exists as the plan: the conversation, a spec, a task list, a design doc, the
+   diff so far. Point workers at those files instead of copying them.
+2. Leave the other workflow in charge of its own steps and gates. Orchestrate inside it: its
+   pending tasks become units, and its checks become this skill's gates. Never rewrite its files
+   unless one of its own steps says to.
+3. Start an orchestration with `new` only when there is delegated work; a step the lead keeps does
+   not need one.
+4. Work that is too small, too coupled or too ambiguous to hand off stays with the lead. Say so in
+   one line rather than forcing a wave.
+
+## Pick a playbook, then adapt
 
 Before planning, run `scripts/orchestrate.py playbook` and read the whole output. It prints the
 effective playbooks file: the user's copy when one exists, otherwise the bundled defaults. It holds
@@ -71,6 +137,27 @@ tiers, the quota and budget rules, the profiles, and the playbooks. [references/
    quota. Pass that model and effort explicitly; never move read-only work to a writable worker.
 5. Say which playbook you picked and why in one line before the first wave.
 
+## Change course
+
+A playbook is where you start, not a contract. Between waves, change the plan whenever the
+results or the user give a reason: skip or repeat a phase, add one the playbook lacks, do a step
+yourself, swap a worker's provider or model, change the budget, switch to another playbook, or drop
+playbooks and plan each wave yourself (freeform). The user can ask for any of these at any time,
+in plain words or with a short command; their request wins over the playbook.
+
+Record each change in one line before the next wave, so the report can explain it:
+
+| Change | Command |
+| --- | --- |
+| skip a phase | `note "<phase>: <why>" --kind skip` |
+| add a phase or a worker | `note "<what>: <why>" --kind add` |
+| switch playbook, or go freeform | `note "to <playbook or freeform>: <why>" --kind switch` |
+| do a step yourself | `note "<what you did>" --kind lead` |
+| anything else | `note "<what changed and why>"` |
+
+A freeform wave is an ordinary plan: leave `playbook` out and name the `phase` after what the wave
+does. Stop a wave that is no longer useful with `stop`; workers that already ran keep their results.
+
 ## Orchestrate
 
 1. Delegate only when the playbook makes the worker overhead worthwhile. `economy` and `rescue`
@@ -87,7 +174,8 @@ tiers, the quota and budget rules, the profiles, and the playbooks. [references/
 5. Create a version-1 plan JSON outside the repository. `scripts/orchestrate.py scaffold
    <strategy> --workers N` prints a valid skeleton to fill in. Use `strategy`, and use
    `provider: auto` only when saved provider switching preferences may decide the provider. Set
-   `budget` when the run needs hard limits, and `budget <folder>` when a limit covers every wave.
+   the plan's `budget` when one wave needs hard limits, and run `budget` when a limit covers every
+   wave of the orchestration.
    Give the plan a `title`, the `playbook` and `phase` it runs, and a one-line `why`; give each
    worker a short `why` naming its role and the reason for its model. The report shows them.
    Write each task as [references/briefs.md](references/briefs.md) describes. Codex and Claude
@@ -100,8 +188,9 @@ tiers, the quota and budget rules, the profiles, and the playbooks. [references/
    When the user wants to see the architecture, save the preview with `dry-run --write`, then
    render it with `scripts/diagram.py` as described in [references/diagram.md](references/diagram.md).
    Show the SVG before running workers and use only confirmed proxy routes.
-7. Run the plan with `scripts/orchestrate.py run`, passing `--run-dir <folder>/<NN>-<phase>` so
-   every wave of one orchestration lands in the same folder. The runner never invokes a shell, caps
+7. Start the orchestration once with `scripts/orchestrate.py new "<title>" --playbook <name>
+   --why "<one line>"`; it creates the folder and makes it current. Run each wave with `run <plan>
+   --in current`, which numbers it after the plan's `phase`. The runner never invokes a shell, caps
    concurrency, enforces the plan budget, terminates timed-out process trees, writes state
    atomically, and leaves worktrees for review.
 8. Read `state.json`, each `outcome.json` (its `workerStatus`, `failureKind` and
@@ -109,11 +198,11 @@ tiers, the quota and budget rules, the profiles, and the playbooks. [references/
    raw logs unless diagnosing a failure.
 9. Integrate reviewed changes, run validation in the combined checkout, `mark` each worker's result
    `used`, `partial` or `discarded`, then remove only temporary data and worktrees whose useful
-   changes were handled.
-10. Close with `scripts/orchestrate.py report <folder>` and show the user its output: what each
-    worker did and why, the time, tokens and cost the CLIs reported, what the spend bought, and
-    what is left to review. Run it whenever the user asks what an orchestration did or cost;
-    without a folder it reads the latest run.
+   changes were handled. `mark <worker> used` finds the worker in the current orchestration.
+10. Close with `scripts/orchestrate.py report` and show the user its output: what each worker did
+    and why, the changes to the plan, the time, tokens and cost the CLIs reported, what the spend
+    bought, and what is left to review. Run it whenever the user asks what an orchestration did or
+    cost; without a folder it reads the current orchestration.
 
 For plan examples, result semantics, selective dirty-state seeding, and cleanup, read
 [references/operations.md](references/operations.md).

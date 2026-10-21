@@ -18,6 +18,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -30,10 +31,28 @@ MAX_WORKERS = 16
 DEFAULT_TIMEOUT_SECONDS = 1200
 ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 SAFE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
-NOTE_LIMITS = {"title": 120, "why": 500, "workerWhy": 300}
+NOTE_LIMITS = {"title": 120, "why": 500, "workerWhy": 300, "note": 300}
 WORKTREE_EXCLUDE = "/.alethe/worktrees/"
 EXCLUDE_LOCK = threading.Lock()
-RAN_STATUSES = ("succeeded", "failed", "timed_out")
+RAN_STATUSES = ("succeeded", "failed", "timed_out", "stopped")
+ORCHESTRATION_FILE = "orchestration.json"
+JOURNAL_FILE = "journal.jsonl"
+CURRENT_FILE = "current.json"
+STOP_FILE = "stop"
+NOTE_KINDS = {"change": "Changed", "skip": "Skipped", "add": "Added", "switch": "Switched", "lead": "Lead did"}
+MODES_FILE = "modes.json"
+MODE_IDLE_SECONDS = 12 * 3600
+MODE_REFRESH_SECONDS = 600
+MAX_MODE_RULES = 8
+MODE_GOALS = {
+    "save": "spend as little as possible: keep small work with the lead and send bounded units to the cheapest capable tier",
+    "balanced": "delegate only when the playbook says it pays, on the tier each unit needs",
+    "max": "get the most out of the available agents: parallel waves, strong reviewers and best-of-n on hard calls",
+}
+MODE_CAREFUL = (
+    "read before writing, give every writer its own worktree, review every diff before integrating it, "
+    "and ask before anything hard to undo"
+)
 UNSAFE_FLAGS = {
     "--dangerously-bypass-approvals-and-sandbox",
     "--dangerously-skip-permissions",
@@ -169,6 +188,7 @@ FAILURE_HINTS = {
     "not_installed": "install the CLI or pick another provider",
     "stalled": "it went quiet for too long; resume its session or narrow the task",
     "timed_out": "it ran out of time; resume its session or narrow the task",
+    "stopped": "it was stopped on request; resume its session or drop the unit",
     "budget": "a budget stopped it; raise the budget or drop the unit",
     "budget_exceeded": "its own cost cap stopped it; raise maxReportedCostUsd or narrow the task",
     "invalid_output": "its output did not parse; check stderr.log and the CLI version",
@@ -1302,6 +1322,7 @@ def watch_process(
     started = time.monotonic()
     last_size = 0
     last_change = last_refresh = started
+    stop_path = state.path.parent / STOP_FILE
     while True:
         remaining = timeout - (time.monotonic() - started)
         if remaining <= 0:
@@ -1311,6 +1332,9 @@ def watch_process(
             return process.wait(timeout=min(POLL_SECONDS, remaining)), None
         except subprocess.TimeoutExpired:
             pass
+        if stop_path.exists():
+            stop_process_tree(process)
+            return exit_code_of(process), "stopped"
         now = time.monotonic()
         size = sum(file_bytes(path) for path in logs)
         if size != last_size:
@@ -1889,6 +1913,9 @@ def run_worker(
         state.update_worker(worker_id, outcome)
         return outcome
 
+    if (run_dir / STOP_FILE).exists():
+        tracker.finish(worker_id, {})
+        return settle(status="skipped", error="stopped on request", failureKind="stopped")
     refusal, cost_cap = tracker.admit(worker_id, worker["provider"] == "claude")
     if refusal is not None:
         tracker.finish(worker_id, {})
@@ -1943,6 +1970,8 @@ def run_worker(
         details = extract_details(values)
         handoff = parse_handoff(result_text)
         kind, reset_hint = classify_failure(status, error, stderr_path, result_text, ended == "stalled")
+        if ended == "stopped":
+            status, error, kind, reset_hint = "stopped", "stopped on request", "stopped", None
         diff_path, diff_error = (
             capture_diff(cwd, worker_dir, worker["isolate"]) if worker["mode"] == "write" else (None, None)
         )
@@ -2074,11 +2103,16 @@ def budget_payload(folder: Path, updates: Dict[str, Any], clear: bool) -> Dict[s
     }
 
 
+def run_with_worker(folder: Path, worker_id: str) -> Path:
+    for run_dir in reversed(wave_dirs(folder)):
+        state = read_optional_json(run_dir / "state.json")
+        if isinstance(state, dict) and worker_id in state.get("workers", {}):
+            return run_dir
+    raise PlanError(f"{folder} has no worker {worker_id}")
+
+
 def mark_payload(run_dir: Path, worker_id: str, mark: str, why: Optional[str]) -> Dict[str, Any]:
-    run_dir = run_dir.expanduser().resolve()
-    state = read_json(run_dir / "state.json")
-    if not isinstance(state, dict) or worker_id not in state.get("workers", {}):
-        raise PlanError(f"{run_dir} has no worker {worker_id}")
+    run_dir = run_with_worker(run_dir.expanduser().resolve(), worker_id)
     entry = {
         "worker": worker_id,
         "mark": mark,
@@ -2087,6 +2121,292 @@ def mark_payload(run_dir: Path, worker_id: str, mark: str, why: Optional[str]) -
     }
     atomic_write_json(run_dir / "workers" / worker_id / "mark.json", entry)
     return entry
+
+
+def orchestrations_home() -> Path:
+    configured = os.environ.get("ALETHE_ORCHESTRATE_HOME")
+    if configured:
+        return Path(configured).expanduser()
+    return default_policy_path().parent / "orchestrations"
+
+
+def slugify(text: str, fallback: str) -> str:
+    plain = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    value = re.sub(r"[^a-z0-9]+", "-", plain.lower()).strip("-")[:40].strip("-")
+    return value or fallback
+
+
+def set_current(folder: Path) -> None:
+    home = orchestrations_home()
+    home.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(home / CURRENT_FILE, {"version": 1, "folder": str(folder), "updatedAt": now_iso()})
+
+
+def current_folder() -> Optional[Path]:
+    raw = read_optional_json(orchestrations_home() / CURRENT_FILE)
+    folder = raw.get("folder") if isinstance(raw, dict) else None
+    if not isinstance(folder, str) or not Path(folder).is_dir():
+        return None
+    return Path(folder)
+
+
+def resolve_folder(raw: Optional[Path]) -> Path:
+    if raw is not None:
+        return raw.expanduser().resolve()
+    current = current_folder()
+    if current is None:
+        raise PlanError("no current orchestration; pass its folder or start one with new")
+    return current
+
+
+def wave_dirs(folder: Path) -> List[Path]:
+    if (folder / "state.json").is_file():
+        return [folder]
+    if not folder.is_dir():
+        return []
+    return sorted(child for child in folder.iterdir() if (child / "state.json").is_file())
+
+
+def next_wave_dir(folder: Path, phase: Any) -> Path:
+    if (folder / "state.json").is_file():
+        raise PlanError(f"{folder} is a single run; start an orchestration with new to add waves")
+    numbered = [child for child in folder.iterdir() if child.is_dir() and re.match(r"^\d{2,}-", child.name)] if folder.is_dir() else []
+    return folder / f"{len(numbered) + 1:02d}-{slugify(phase if isinstance(phase, str) else '', 'wave')}"
+
+
+def new_orchestration(title: str, playbook: Optional[str], why: Optional[str]) -> Dict[str, Any]:
+    meta = {
+        "version": 1,
+        "title": optional_note(require_string(title, "title"), "title", NOTE_LIMITS["title"]),
+        "playbook": optional_name(playbook, "playbook"),
+        "why": optional_note(why, "why", NOTE_LIMITS["why"]),
+        "createdAt": now_iso(),
+    }
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    folder = orchestrations_home() / f"{stamp}-{slugify(meta['title'], 'orchestration')}"
+    folder.mkdir(parents=True)
+    atomic_write_json(folder / ORCHESTRATION_FILE, meta)
+    set_current(folder)
+    return {"folder": str(folder), **meta}
+
+
+def orchestration_meta(folder: Optional[Path]) -> Dict[str, Any]:
+    raw = read_optional_json(folder / ORCHESTRATION_FILE) if folder is not None else None
+    return raw if isinstance(raw, dict) else {}
+
+
+def add_note(folder: Path, text: str, kind: str) -> Dict[str, Any]:
+    if not folder.is_dir():
+        raise PlanError(f"not an orchestration folder: {folder}")
+    note = optional_note(text, "note", NOTE_LIMITS["note"])
+    if not note:
+        raise PlanError("a note needs text")
+    entry = {"at": now_iso(), "kind": kind, "text": note}
+    with (folder / JOURNAL_FILE).open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    return entry
+
+
+def read_journal(folder: Optional[Path]) -> List[Dict[str, Any]]:
+    if folder is None:
+        return []
+    try:
+        lines = (folder / JOURNAL_FILE).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    entries = []
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(entry, dict) and entry.get("kind") in NOTE_KINDS and isinstance(entry.get("text"), str):
+            entries.append(entry)
+    return entries
+
+
+def stop_payload(folder: Path) -> Dict[str, Any]:
+    running = []
+    for run_dir in wave_dirs(folder):
+        state = read_optional_json(run_dir / "state.json")
+        if isinstance(state, dict) and state.get("status") == "running":
+            atomic_write_text(run_dir / STOP_FILE, now_iso() + "\n")
+            running.append(str(run_dir))
+    return {
+        "folder": str(folder),
+        "stopping": running,
+        "note": "running workers stop within seconds and queued ones are skipped" if running else "nothing is running",
+    }
+
+
+def report_target(paths: Sequence[Path]) -> Tuple[List[Path], Optional[Path]]:
+    if paths:
+        folder = paths[0].expanduser().resolve() if len(paths) == 1 else None
+        return find_run_dirs(paths), folder
+    current = current_folder()
+    if current is None:
+        return find_run_dirs([]), None
+    runs = wave_dirs(current)
+    if not runs:
+        raise PlanError(f"{current} has no waves yet; run one with run --in current")
+    return runs, current
+
+
+def list_payload(limit: int) -> List[Dict[str, Any]]:
+    home = orchestrations_home()
+    folders = [child for child in home.iterdir() if child.is_dir()] if home.is_dir() else []
+    current = current_folder()
+    if current is not None and current.resolve() not in {folder.resolve() for folder in folders}:
+        folders.append(current)
+    entries = []
+    for folder in folders:
+        meta = orchestration_meta(folder)
+        runs = wave_dirs(folder)
+        entry = {
+            "folder": str(folder),
+            "current": current is not None and folder.resolve() == current.resolve(),
+            "title": meta.get("title"),
+            "playbooks": [meta["playbook"]] if meta.get("playbook") else [],
+            "startedAt": meta.get("createdAt"),
+            "waves": len(runs),
+            "status": None,
+            "calls": 0,
+            "tokens": None,
+            "costUsd": None,
+            "planChanges": len(read_journal(folder)),
+        }
+        if runs:
+            try:
+                report = build_report(runs, folder)
+            except (PlanError, OSError):
+                report = None
+            if report is not None:
+                totals = report["totals"]
+                entry.update(
+                    title=report["title"],
+                    playbooks=report["playbooks"],
+                    startedAt=entry["startedAt"] or report["startedAt"],
+                    status=report["runs"][-1]["status"],
+                    calls=totals["calls"],
+                    tokens=totals["tokens"],
+                    costUsd=totals["costUsd"],
+                )
+        if runs or meta:
+            entries.append(entry)
+    entries.sort(key=lambda entry: entry["startedAt"] or "", reverse=True)
+    return entries[:limit]
+
+
+def render_list(entries: Sequence[Dict[str, Any]]) -> str:
+    if not entries:
+        return "No orchestrations yet.\n"
+    lines = []
+    for entry in entries:
+        started = local_time(entry["startedAt"])
+        parts = [entry["title"] or Path(entry["folder"]).name]
+        if entry["playbooks"]:
+            parts.append("playbook " + ", ".join(entry["playbooks"]))
+        parts.append(counted(entry["waves"], "wave") + (f", {entry['status']}" if entry["status"] else ""))
+        parts.append(f"{counted(entry['calls'], 'call')}, {spend_text(entry['tokens'], entry['costUsd'])}")
+        if entry["planChanges"]:
+            parts.append(counted(entry["planChanges"], "plan change"))
+        when = started.strftime("%Y-%m-%d %H:%M") if started else "----------------"
+        lines.append(f"{'*' if entry['current'] else ' '} {when}  " + " | ".join(parts))
+        lines.append(f"    {entry['folder']}")
+    return "\n".join(lines) + "\n"
+
+
+def mode_scope(cwd: Path) -> Path:
+    cwd = cwd.expanduser().resolve()
+    return checkout_root(cwd) or cwd
+
+
+def live_modes(now: float) -> Dict[str, Any]:
+    raw = read_optional_json(orchestrations_home() / MODES_FILE)
+    modes = raw.get("modes") if isinstance(raw, dict) else None
+    if not isinstance(modes, dict):
+        return {}
+    return {
+        scope: mode
+        for scope, mode in modes.items()
+        if isinstance(mode, dict) and now - float(number(mode.get("seenAt")) or 0) < MODE_IDLE_SECONDS
+    }
+
+
+def save_modes(modes: Dict[str, Any]) -> None:
+    home = orchestrations_home()
+    home.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(home / MODES_FILE, {"version": 1, "modes": modes})
+
+
+def mode_payload(
+    action: str, cwd: Path, goal: Optional[str], care: Optional[str], rules: Sequence[str], clear_rules: bool
+) -> Dict[str, Any]:
+    now = time.time()
+    scope = str(mode_scope(cwd))
+    modes = live_modes(now)
+    if action == "off":
+        modes.pop(scope, None)
+        save_modes(modes)
+        return {"scope": scope, "on": False}
+    mode = modes.get(scope)
+    if action == "show":
+        return {"scope": scope, "on": mode is not None, **(mode or {})}
+    mode = dict(mode or {"goal": "balanced", "care": "normal", "rules": [], "since": now_iso()})
+    if goal:
+        mode["goal"] = goal
+    if care:
+        mode["care"] = care
+    kept = [] if clear_rules else list(mode.get("rules") or [])
+    for rule in rules:
+        text = optional_note(rule, "rule", NOTE_LIMITS["note"])
+        if text and text not in kept:
+            kept.append(text)
+    if len(kept) > MAX_MODE_RULES:
+        raise PlanError(f"keep at most {MAX_MODE_RULES} rules; pass --clear-rules to start over")
+    mode.update(rules=kept, seenAt=now)
+    modes[scope] = mode
+    save_modes(modes)
+    return {"scope": scope, "on": True, **mode}
+
+
+def mode_reminder(mode: Dict[str, Any]) -> str:
+    goal = mode.get("goal") if mode.get("goal") in MODE_GOALS else "balanced"
+    parts = [
+        "Alethe orchestration is on for this project, so the user does not need to call it again.",
+        f"Goal: {goal}, {MODE_GOALS[goal]}.",
+    ]
+    if mode.get("care") == "careful":
+        parts.append(f"Careful: {MODE_CAREFUL}.")
+    rules = [rule for rule in mode.get("rules") or [] if isinstance(rule, str)]
+    if rules:
+        parts.append("User rules: " + "; ".join(rules) + ".")
+    parts.append(
+        "Follow the alethe-orchestrate skill for each request: do it yourself when that is cheaper, "
+        "delegate bounded units when it pays, and leave any other skill or spec workflow in charge of "
+        "its own steps. '/alethe off' turns this off."
+    )
+    return " ".join(parts)
+
+
+def hook_output(stdin_text: str) -> str:
+    try:
+        event = json.loads(stdin_text) if stdin_text.strip() else {}
+        cwd = Path(event.get("cwd") or os.getcwd()) if isinstance(event, dict) else Path(os.getcwd())
+        here = cwd.expanduser().resolve()
+        now = time.time()
+        modes = live_modes(now)
+        matches = [scope for scope in modes if here == Path(scope) or is_inside(here, Path(scope))]
+        if not matches:
+            return ""
+        scope = max(matches, key=len)
+        mode = modes[scope]
+        if now - float(number(mode.get("seenAt")) or 0) > MODE_REFRESH_SECONDS:
+            mode["seenAt"] = now
+            save_modes(modes)
+        return mode_reminder(mode) + "\n"
+    except Exception:  # A hook must never block the user's prompt.
+        return ""
 
 
 def task_text(worker: Dict[str, Any]) -> str:
@@ -2183,6 +2503,10 @@ def run_batch(
     atomic_write_json(
         run_dir / "plan.json", plan_payload(plan, plan_path.resolve(), policy_path, dry_run=False)
     )
+    try:
+        set_current(run_dir.parent if requested_run_dir is not None else run_dir)
+    except OSError:
+        pass
     suffix = run_dir.name[-8:]
     run_id = suffix if re.fullmatch(r"[0-9a-f]{8}", suffix) else uuid.uuid4().hex[:8]
     initial_workers = {
@@ -2251,6 +2575,8 @@ def run_batch(
 
     succeeded = sum(outcome["status"] == "succeeded" for outcome in outcomes)
     status = "done" if succeeded == len(outcomes) else "partial" if succeeded else "failed"
+    if any(outcome["failureKind"] == "stopped" for outcome in outcomes):
+        status = "stopped"
     budget_usage = tracker.usage()
     state.finish(status, {"budgetUsage": budget_usage})
     print(
@@ -2615,7 +2941,8 @@ def summed(values: Sequence[Any]) -> Optional[float]:
     return sum(known) if known else None
 
 
-def build_report(run_dirs: Sequence[Path]) -> Dict[str, Any]:
+def build_report(run_dirs: Sequence[Path], folder: Optional[Path] = None) -> Dict[str, Any]:
+    meta = orchestration_meta(folder)
     runs = sorted((collect_run(path) for path in run_dirs), key=lambda run: run["startedAt"] or "")
     workers = [worker for run in runs for worker in run["workers"]]
     ran = [
@@ -2653,7 +2980,9 @@ def build_report(run_dirs: Sequence[Path]) -> Dict[str, Any]:
             key = worker["workerStatus"] or "unreported"
             said[key] = said.get(key, 0) + 1
     titles = [run["title"] for run in runs if run["title"]]
-    playbooks: List[str] = []
+    if meta.get("title"):
+        titles.insert(0, meta["title"])
+    playbooks: List[str] = [meta["playbook"]] if meta.get("playbook") else []
     for run in runs:
         if run["playbook"] and run["playbook"] not in playbooks:
             playbooks.append(run["playbook"])
@@ -2663,6 +2992,8 @@ def build_report(run_dirs: Sequence[Path]) -> Dict[str, Any]:
         "skillVersion": skill_version(),
         "title": titles[0] if titles else None,
         "playbooks": playbooks,
+        "why": meta.get("why"),
+        "journal": read_journal(folder),
         "startedAt": runs[0]["startedAt"] if runs else None,
         "finishedAt": max((run["finishedAt"] or "" for run in runs), default="") or None,
         "totals": {
@@ -2722,7 +3053,7 @@ def build_report(run_dirs: Sequence[Path]) -> Dict[str, Any]:
                     "stderrPath": w["stderrPath"],
                     "provider": w["provider"],
                     "resume": w["sessionId"]
-                    if w["status"] in ("failed", "timed_out")
+                    if w["status"] in ("failed", "timed_out", "stopped")
                     and PROVIDER_CAPABILITIES.get(w["provider"], {}).get("resume")
                     else None,
                 }
@@ -2898,7 +3229,9 @@ def render_markdown(report: Dict[str, Any]) -> str:
             span += finished.strftime(" to %H:%M" if finished.date() == started.date() else " to %Y-%m-%d %H:%M")
         heading.append(span)
     lines += [", ".join(heading), ""]
-    if len(runs) == 1 and runs[0]["why"]:
+    if report["why"]:
+        lines += [f"Why: {cell(report['why'])}", ""]
+    elif len(runs) == 1 and runs[0]["why"]:
         lines += [f"Why: {cell(runs[0]['why'])}", ""]
 
     statuses = totals["statuses"]
@@ -3020,6 +3353,13 @@ def render_markdown(report: Dict[str, Any]) -> str:
                 text += f" _({cell('; '.join(notes))})_"
             lines.append(f"- `{worker['id']}`: {text}")
 
+    if report["journal"]:
+        lines += ["", "## Changes to the plan", ""]
+        for entry in report["journal"]:
+            stamp = local_time(entry.get("at"))
+            when = stamp.strftime("%H:%M ") if stamp else ""
+            lines.append(f"- {when}{NOTE_KINDS[entry['kind']]}: {cell(entry['text'])}")
+
     if len(report["byProvider"]) > 1:
         lines += ["", "## By provider", "", "| Provider | Workers | Time | Tokens | Cost |", "| --- | --- | --- | --- | --- |"]
         for provider, entry in report["byProvider"].items():
@@ -3084,6 +3424,9 @@ def render_status(report: Dict[str, Any]) -> str:
         waves.append(f"{index}. {run['phase'] or 'wave'} {run['status']} ({done}/{len(run['workers'])})")
     lines.append("Waves: " + "; ".join(waves))
     lines.append(f"Spent: {counted(totals['calls'], 'worker call')}, {spend_text(totals['tokens'], totals['costUsd'])}")
+    if report["journal"]:
+        last = report["journal"][-1]
+        lines.append(f"Plan changes: {len(report['journal'])}, last: {NOTE_KINDS[last['kind']].lower()} {last['text'][:90]}")
     outer = report["orchestrationBudget"]
     if outer:
         used = outer["used"]
@@ -3354,6 +3697,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     run_parser = subparsers.add_parser("run", help="run a batch plan")
     run_parser.add_argument("plan", type=Path)
     run_parser.add_argument("--run-dir", type=Path)
+    run_parser.add_argument(
+        "--in", dest="into", metavar="FOLDER", help="add the run as the next wave of an orchestration folder, or 'current'"
+    )
     run_parser.add_argument("--policy", type=Path)
     run_parser.add_argument("--strategy", choices=list(STRATEGIES))
     report_parser = subparsers.add_parser(
@@ -3371,10 +3717,37 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "status", help="print a few lines on where an orchestration stands, to pick it up again"
     )
     status_parser.add_argument("runs", nargs="*", type=Path)
+    new_parser = subparsers.add_parser("new", help="start an orchestration folder and make it the current one")
+    new_parser.add_argument("title")
+    new_parser.add_argument("--playbook")
+    new_parser.add_argument("--why")
+    list_parser = subparsers.add_parser("list", help="list recent orchestrations; * marks the current one")
+    list_parser.add_argument("--limit", type=int, default=10)
+    list_parser.add_argument("--format", choices=["text", "json"], default="text")
+    use_parser = subparsers.add_parser("use", help="make an orchestration folder the current one")
+    use_parser.add_argument("folder", type=Path)
+    note_parser = subparsers.add_parser(
+        "note", help="record a change to the plan, such as a skipped phase or a switched playbook"
+    )
+    note_parser.add_argument("text")
+    note_parser.add_argument("--kind", choices=list(NOTE_KINDS), default="change")
+    note_parser.add_argument("--in", dest="into", type=Path, metavar="FOLDER")
+    stop_parser = subparsers.add_parser("stop", help="stop the running waves of an orchestration")
+    stop_parser.add_argument("folder", nargs="?", type=Path)
+    mode_parser = subparsers.add_parser(
+        "mode", help="keep orchestration on for a project, with a goal, care level and the user's standing rules"
+    )
+    mode_parser.add_argument("action", choices=["on", "off", "show"])
+    mode_parser.add_argument("--goal", choices=list(MODE_GOALS))
+    mode_parser.add_argument("--care", choices=["normal", "careful"])
+    mode_parser.add_argument("--rule", action="append", default=[], help="a standing instruction, in the user's words")
+    mode_parser.add_argument("--clear-rules", action="store_true")
+    mode_parser.add_argument("--cwd", type=Path, default=Path("."))
+    subparsers.add_parser("hook", help="print the reminder for an agent hook while a mode is on; never fails")
     budget_parser = subparsers.add_parser(
         "budget", help="show or set the limits for every wave in an orchestration folder"
     )
-    budget_parser.add_argument("folder", type=Path)
+    budget_parser.add_argument("folder", nargs="?", type=Path)
     budget_parser.add_argument("--max-calls", type=int)
     budget_parser.add_argument("--max-reported-cost-usd", type=float)
     budget_parser.add_argument("--max-reported-tokens", type=int)
@@ -3382,9 +3755,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     mark_parser = subparsers.add_parser(
         "mark", help="record whether a worker's result was used, so the report shows what the spend bought"
     )
-    mark_parser.add_argument("run_dir", type=Path)
-    mark_parser.add_argument("worker")
-    mark_parser.add_argument("mark", choices=list(MARKS))
+    mark_parser.add_argument("target", nargs="+", metavar="[FOLDER] WORKER MARK")
     mark_parser.add_argument("--why")
     policy_parser = subparsers.add_parser("policy", help="show or change skill-only preferences")
     policy_parser.add_argument("policy_action", choices=["show", "set", "reset"])
@@ -3434,7 +3805,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(json.dumps(doctor_payload(policy_path), indent=2, ensure_ascii=False))
             return 0
         if args.command == "report":
-            report = build_report(find_run_dirs(args.runs))
+            report = build_report(*report_target(args.runs))
             if args.format == "json":
                 text = json.dumps(report, indent=2, ensure_ascii=False) + "\n"
             else:
@@ -3444,7 +3815,39 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(text, end="")
             return 0
         if args.command == "status":
-            print(render_status(build_report(find_run_dirs(args.runs))), end="")
+            print(render_status(build_report(*report_target(args.runs))), end="")
+            return 0
+        if args.command == "new":
+            print(json.dumps(new_orchestration(args.title, args.playbook, args.why), indent=2, ensure_ascii=False))
+            return 0
+        if args.command == "list":
+            entries = list_payload(max(1, args.limit))
+            if args.format == "json":
+                print(json.dumps(entries, indent=2, ensure_ascii=False))
+            else:
+                print(render_list(entries), end="")
+            return 0
+        if args.command == "use":
+            folder = args.folder.expanduser().resolve()
+            if not folder.is_dir():
+                raise PlanError(f"not an orchestration folder: {folder}")
+            set_current(folder)
+            print(json.dumps({"current": str(folder)}, indent=2))
+            return 0
+        if args.command == "note":
+            print(json.dumps(add_note(resolve_folder(args.into), args.text, args.kind), indent=2, ensure_ascii=False))
+            return 0
+        if args.command == "mode":
+            if args.action != "on" and (args.goal or args.care or args.rule or args.clear_rules):
+                raise PlanError("--goal, --care and --rule go with mode on")
+            payload = mode_payload(args.action, args.cwd, args.goal, args.care, args.rule, args.clear_rules)
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+            return 0
+        if args.command == "hook":
+            print(hook_output(sys.stdin.read()), end="")
+            return 0
+        if args.command == "stop":
+            print(json.dumps(stop_payload(resolve_folder(args.folder)), indent=2))
             return 0
         if args.command == "budget":
             updates = {
@@ -3458,10 +3861,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             }
             if args.clear and updates:
                 raise PlanError("pass --clear or new limits, not both")
-            print(json.dumps(budget_payload(args.folder, updates, args.clear), indent=2))
+            print(json.dumps(budget_payload(resolve_folder(args.folder), updates, args.clear), indent=2))
             return 0
         if args.command == "mark":
-            print(json.dumps(mark_payload(args.run_dir, args.worker, args.mark, args.why), indent=2, ensure_ascii=False))
+            if len(args.target) not in (2, 3) or args.target[-1] not in MARKS:
+                raise PlanError(f"usage: mark [FOLDER] WORKER {{{','.join(MARKS)}}}")
+            folder = resolve_folder(Path(args.target[0]) if len(args.target) == 3 else None)
+            entry = mark_payload(folder, args.target[-2], args.target[-1], args.why)
+            print(json.dumps(entry, indent=2, ensure_ascii=False))
             return 0
         if args.command == "scaffold":
             plan = scaffold_plan(args.strategy, args.workers, args.cwd, args.provider)
@@ -3523,7 +3930,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
             return 0
         policy_path = (args.policy or default_policy_path()).expanduser().resolve()
-        return run_batch(args.plan, args.run_dir, policy_path, args.strategy)
+        run_dir = args.run_dir
+        if args.into:
+            if run_dir is not None:
+                raise PlanError("pass --run-dir or --in, not both")
+            raw = read_json(args.plan)
+            folder = resolve_folder(None if args.into == "current" else Path(args.into))
+            run_dir = next_wave_dir(folder, raw.get("phase") if isinstance(raw, dict) else None)
+        return run_batch(args.plan, run_dir, policy_path, args.strategy)
     except PlanError as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
