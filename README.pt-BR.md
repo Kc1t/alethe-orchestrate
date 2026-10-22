@@ -64,28 +64,19 @@ Ou copie `skills/alethe-orchestrate` para `~/.claude/skills/`, `~/.codex/skills/
 
 ## Comandos
 
-Digite depois de `/alethe`, ou depois de "alethe" num agente sem comandos de barra. Uma tarefa com suas palavras também é um comando.
+Digite depois de `/alethe`.
 
-| | Comando | O que faz |
-| --- | --- | --- |
-| Setup | `setup` | Confere as CLIs e guia a primeira configuração |
-| | `help` | Lista estes comandos |
-| Rodar | `<tarefa>` | Orquestra a tarefa |
-| | `budget <limite>` | Limita chamadas, custo ou tokens informados em todas as waves |
-| | `stop` | Para os workers rodando e pula os da fila |
-| Deixar ligado | `always` | Ligado em todo projeto, sem expirar |
-| | `on` | Ligado neste projeto, até `off` ou 12 horas sem prompt |
-| | `a partir de agora <instrução>` | Ligado, com a sua instrução guardada como regra |
-| | `save`, `balanced`, `max` | Ligado, com esse objetivo: gastar menos, equilibrar ou tirar o máximo |
-| | `careful` | Ligado, com mais checagens antes de qualquer coisa arriscada |
-| | `off`, `off everywhere` | Desliga neste projeto, ou em todos |
-| Mudar o rumo | `skip <fase>`, `add <fase>` | Pula uma fase do playbook, ou adiciona uma |
-| | `switch <playbook>`, `freeform` | Troca de playbook, ou segue sem playbook |
-| | `note <texto>` | Registra uma mudança que você mesmo fez |
-| Resultados | `status` | Onde a orquestração atual está, em poucas linhas |
-| | `report` | O relatório completo: cada wave, worker, mudança e custo |
-| | `mark <worker> used\|partial\|discarded` | Registra quanto um resultado valeu |
-| | `list`, `use <pasta>` | Orquestrações recentes; torna uma delas a atual de novo |
+| Comando | O que faz |
+| --- | --- |
+| `setup` | Confere suas CLIs e configura tudo |
+| `<tarefa>` | Orquestra a tarefa |
+| `always` | Deixa ligado em todo projeto |
+| `status` | Onde está |
+| `stop` | Para os workers |
+| `report` | O que cada worker fez e custou |
+| `off` | Desliga aqui |
+
+`/alethe help` lista o resto.
 
 ## Deixar Ligado
 

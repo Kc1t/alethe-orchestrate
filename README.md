@@ -64,28 +64,19 @@ Or copy `skills/alethe-orchestrate` into `~/.claude/skills/`, `~/.codex/skills/`
 
 ## Commands
 
-Type them after `/alethe`, or after "alethe" in an agent without slash commands. A task in plain words is a command too.
+Type them after `/alethe`.
 
-| | Command | What it does |
-| --- | --- | --- |
-| Setup | `setup` | Checks the CLIs and walks you through the first configuration |
-| | `help` | Lists these commands |
-| Run | `<task>` | Orchestrates the task |
-| | `budget <limit>` | Caps calls, reported cost or tokens for every wave |
-| | `stop` | Stops the running workers and skips the queued ones |
-| Keep it on | `always` | On in every project, with no expiry |
-| | `on` | On for this project, until `off` or 12 hours without a prompt |
-| | `from now on <instruction>` | On, with your instruction kept as a rule |
-| | `save`, `balanced`, `max` | On, with that goal: spend less, balance, or get the most out of it |
-| | `careful` | On, with more checks before anything risky |
-| | `off`, `off everywhere` | Off in this project, or everywhere |
-| Change course | `skip <phase>`, `add <phase>` | Skips a phase of the playbook, or adds one |
-| | `switch <playbook>`, `freeform` | Moves to another playbook, or drops the playbook |
-| | `note <text>` | Records a change you made yourself |
-| Results | `status` | Where the current orchestration stands, in a few lines |
-| | `report` | The full report: every wave, worker, change and cost |
-| | `mark <worker> used\|partial\|discarded` | Records what a result was worth |
-| | `list`, `use <folder>` | Recent orchestrations; makes one current again |
+| Command | What it does |
+| --- | --- |
+| `setup` | Checks your CLIs and sets everything up |
+| `<task>` | Orchestrates the task |
+| `always` | Keeps it on in every project |
+| `status` | Where it stands |
+| `stop` | Stops the workers |
+| `report` | What each worker did and cost |
+| `off` | Turns it off here |
+
+`/alethe help` lists the rest.
 
 ## Keep It On
 
