@@ -266,7 +266,8 @@ class RunnerTest(Fixtures):
         self.assertEqual(plugin["version"], expected)
         self.assertEqual([entry["version"] for entry in marketplace["plugins"]], [expected])
         self.assertTrue((ROOT / plugin["skills"] / "alethe-orchestrate" / "SKILL.md").is_file())
-        self.assertIn(f"badge/skill-v{version}-", (ROOT / "README.md").read_text(encoding="utf-8"))
+        for readme in ("README.md", "README.pt-BR.md"):
+            self.assertIn(f"badge/skill-v{version}-", (ROOT / readme).read_text(encoding="utf-8"))
 
     @unittest.skipUnless(os.name == "nt", "batch files exist only on Windows")
     def test_npm_style_shims_receive_the_whole_prompt(self):
