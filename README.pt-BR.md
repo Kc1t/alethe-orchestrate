@@ -28,8 +28,6 @@
 npx skills add Kc1t/alethe-orchestrate-skill
 ```
 
-Depois digite `/alethe setup`. A partir daí, peça com suas palavras: "orquestra essa refatoração", "quanto custou isso?".
-
 <details>
 <summary>Plugin do Claude Code, plugin do Codex ou manual</summary>
 
@@ -48,17 +46,14 @@ Ou copie `skills/alethe-orchestrate` para `~/.claude/skills/`, `~/.codex/skills/
 
 </details>
 
-| Digite | O que faz |
-| --- | --- |
-| `/alethe <tarefa>` | Orquestra a tarefa |
-| `/alethe always` | Deixa ligado em todo projeto, para você nunca mais chamar |
-| `/alethe on`, `save`, `max`, `careful` | Deixa ligado neste projeto, com esse objetivo ou nível de cuidado |
-| `/alethe a partir de agora <instrução>` | Deixa ligado, com a sua instrução como regra fixa |
-| `/alethe report`, `status`, `list` | O que a orquestração atual fez e custou |
-| `/alethe stop`, `skip <fase>`, `switch <playbook>` | Muda o rumo e registra o porquê |
-| `/alethe off` | Desliga aqui |
+## Primeiros Passos
 
-## Como Funciona
+1. **Instale** com o comando acima.
+2. **`/alethe setup`** confere quais CLIs de agente você tem e se estão logadas, lista os modelos e propõe três perfis: base, savings e aggressive. Nada é salvo antes de você aprovar.
+3. **`/alethe always`** (opcional) deixa ligado em todo projeto, para você nunca mais digitar `/alethe`.
+4. **Peça o trabalho**: `/alethe migra os endpoints de billing para a v2`, ou só peça com suas palavras enquanto estiver ligado. O líder escolhe um playbook, mostra a prévia do plano e roda os workers.
+5. **`/alethe status`** enquanto roda, **`/alethe stop`** para parar.
+6. **`/alethe report`** quando terminar: o que cada worker fez, por quê e quanto custou. **`/alethe mark <worker> used`** registra o que você aproveitou.
 
 <p align="center">
   <picture>
@@ -67,12 +62,45 @@ Ou copie `skills/alethe-orchestrate` para `~/.claude/skills/`, `~/.codex/skills/
   </picture>
 </p>
 
+## Comandos
+
+Digite depois de `/alethe`, ou depois de "alethe" num agente sem comandos de barra. Uma tarefa com suas palavras também é um comando.
+
+| | Comando | O que faz |
+| --- | --- | --- |
+| Setup | `setup` | Confere as CLIs e guia a primeira configuração |
+| | `help` | Lista estes comandos |
+| Rodar | `<tarefa>` | Orquestra a tarefa |
+| | `budget <limite>` | Limita chamadas, custo ou tokens informados em todas as waves |
+| | `stop` | Para os workers rodando e pula os da fila |
+| Deixar ligado | `always` | Ligado em todo projeto, sem expirar |
+| | `on` | Ligado neste projeto, até `off` ou 12 horas sem prompt |
+| | `a partir de agora <instrução>` | Ligado, com a sua instrução guardada como regra |
+| | `save`, `balanced`, `max` | Ligado, com esse objetivo: gastar menos, equilibrar ou tirar o máximo |
+| | `careful` | Ligado, com mais checagens antes de qualquer coisa arriscada |
+| | `off`, `off everywhere` | Desliga neste projeto, ou em todos |
+| Mudar o rumo | `skip <fase>`, `add <fase>` | Pula uma fase do playbook, ou adiciona uma |
+| | `switch <playbook>`, `freeform` | Troca de playbook, ou segue sem playbook |
+| | `note <texto>` | Registra uma mudança que você mesmo fez |
+| Resultados | `status` | Onde a orquestração atual está, em poucas linhas |
+| | `report` | O relatório completo: cada wave, worker, mudança e custo |
+| | `mark <worker> used\|partial\|discarded` | Registra quanto um resultado valeu |
+| | `list`, `use <pasta>` | Orquestrações recentes; torna uma delas a atual de novo |
+
+## Deixar Ligado
+
+Com `always` ou `on`, cada prompt lembra o líder do seu objetivo e das suas regras, e ele decide a cada pedido se passa o trabalho adiante.
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="./docs/assets/drawings/stay-on-dark.svg">
     <img src="./docs/assets/drawings/stay-on-light.svg" alt="Uma conversa. A primeira mensagem diz /alethe a partir de agora, cuidado com o banco, e o líder liga o modo cuidadoso e guarda a frase como regra. As mensagens seguintes não precisam de /alethe: um hook lembra o líder do objetivo, do cuidado e das regras. Ele corrige um typo sozinho, orquestra a mudança de 40 endpoints com scouts baratos e writers em worktrees, e responde como está indo com um status curto" width="820">
   </picture>
 </p>
+
+## Entrar no Meio da Tarefa
+
+Ela entra no meio do fluxo de outra skill: a spec e o diff até ali viram o plano.
 
 <p align="center">
   <picture>
@@ -81,31 +109,16 @@ Ou copie `skills/alethe-orchestrate` para `~/.claude/skills/`, `~/.codex/skills/
   </picture>
 </p>
 
-## Por Que É Diferente
+## Mudar o Rumo
 
-- **Gasto real, nunca estimado:** tokens e custo como cada CLI informou, separados entre resultados usados e descartados.
-- **Limites aplicados:** orçamento por wave e por orquestração, teto de custo nos workers Claude, sem subagentes.
-- **Workers enxutos e conferidos:** sem servidores MCP nos workers Codex e Claude, e o git pega um worker só leitura que escreveu.
-- **Fácil de auditar:** só a biblioteca padrão do Python, sem shell, sem rede, sem scripts de instalação.
+O playbook é um ponto de partida. `skip`, `add`, `switch` e `freeform` mudam ele entre as waves, e o relatório lista cada mudança com o motivo.
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="./docs/assets/drawings/savings-dark.svg">
-    <img src="./docs/assets/drawings/savings-light.svg" alt="Dois gráficos de barras desenhados à mão. À esquerda: um worker Claude haiku na mesma tarefa de uma linha usou 76.160 tokens e US$ 0,16 na versão 11, e 38.157 tokens e US$ 0,08 na versão 12. À direita: numa execução real com dois workers, 5,0 KB de transcrições ficaram no disco e o líder leu 595 bytes de resultados" width="820">
+    <source media="(prefers-color-scheme: dark)" srcset="./docs/assets/drawings/change-course-dark.svg">
+    <img src="./docs/assets/drawings/change-course-light.svg" alt="Em cima, tracejado: o playbook scout-then-build, com scout, plan, build e review. Embaixo, o que rodou: scout, plan, uma wave livre para corrigir o script de build porque o bug estava lá, build, e review riscado porque o diff tinha três linhas. O journal.jsonl registra cada mudança com o motivo, e o relatório mostra todas em Changes to the plan" width="820">
   </picture>
 </p>
-
-## Agentes
-
-| Agente | CLI | Só leitura | Escrita | Retomar | Informa |
-|:-:|---|---|---|:-:|---|
-| <img src="./docs/assets/agents/claude-code.png" width="28" height="28" alt=""><br>**Claude Code** | `claude` | permission mode `plan` | `acceptEdits` | ✓ | Tokens e custo |
-| <img src="./docs/assets/agents/codex.png" width="28" height="28" alt=""><br>**Codex** | `codex` | sandbox `read-only` | sandbox `workspace-write` | ✓ | Tokens |
-| <img src="./docs/assets/agents/antigravity.png" width="28" height="28" alt=""><br>**Antigravity** | `agy` | modo `plan` | modo `accept-edits` | ✓ | Tokens |
-| <picture><source media="(prefers-color-scheme: dark)" srcset="./docs/assets/agents/kimi-dark.svg"><img src="./docs/assets/agents/kimi-light.svg" width="28" height="28" alt=""></picture><br>**Kimi Code** | `kimi` | Contrato, conferido depois | Modo prompt, na própria worktree | ✓ | Nada |
-| <picture><source media="(prefers-color-scheme: dark)" srcset="./docs/assets/agents/shell-dark.svg"><img src="./docs/assets/agents/shell-light.svg" width="28" height="28" alt=""></picture><br>**Qualquer outra CLI** | o seu adapter | Contrato, conferido depois | A flag de escrita mais restrita dela | | O que a saída trouxer |
-
-Qualquer outra CLI com modo não interativo, como Kiro, Copilot CLI ou Gemini CLI, roda como worker customizado.
 
 ## Playbooks
 
@@ -123,10 +136,29 @@ Qualquer outra CLI com modo não interativo, como Kiro, Copilot CLI ou Gemini CL
 | `review-gate` | Um diff pronto antes do merge | Revisão forte só em diffs que valem a pena |
 | `complete` | Qualquer outra coisa; as condições decidem por unidade | Cada unidade roda no papel mais barato que serve |
 
+## Agentes
+
+| Agente | CLI | Só leitura | Escrita | Retomar | Informa |
+|:-:|---|---|---|:-:|---|
+| <img src="./docs/assets/agents/claude-code.png" width="28" height="28" alt=""><br>**Claude Code** | `claude` | permission mode `plan` | `acceptEdits` | ✓ | Tokens e custo |
+| <img src="./docs/assets/agents/codex.png" width="28" height="28" alt=""><br>**Codex** | `codex` | sandbox `read-only` | sandbox `workspace-write` | ✓ | Tokens |
+| <img src="./docs/assets/agents/antigravity.png" width="28" height="28" alt=""><br>**Antigravity** | `agy` | modo `plan` | modo `accept-edits` | ✓ | Tokens |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="./docs/assets/agents/kimi-dark.svg"><img src="./docs/assets/agents/kimi-light.svg" width="28" height="28" alt=""></picture><br>**Kimi Code** | `kimi` | Contrato, conferido depois | Modo prompt, na própria worktree | ✓ | Nada |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="./docs/assets/agents/shell-dark.svg"><img src="./docs/assets/agents/shell-light.svg" width="28" height="28" alt=""></picture><br>**Qualquer outra CLI** | o seu adapter | Contrato, conferido depois | A flag de escrita mais restrita dela | | O que a saída trouxer |
+
+Qualquer outra CLI com modo não interativo, como Kiro, Copilot CLI ou Gemini CLI, roda como worker customizado.
+
+## Por Que É Diferente
+
+- **Gasto real, nunca estimado:** tokens e custo como cada CLI informou, separados entre resultados usados e descartados.
+- **Limites aplicados:** orçamento por wave e por orquestração, teto de custo nos workers Claude, sem subagentes.
+- **Workers enxutos e conferidos:** sem servidores MCP nos workers Codex e Claude, e o git pega um worker só leitura que escreveu.
+- **Fácil de auditar:** só a biblioteca padrão do Python, sem shell, sem rede, sem scripts de instalação.
+
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="./docs/assets/drawings/change-course-dark.svg">
-    <img src="./docs/assets/drawings/change-course-light.svg" alt="Em cima, tracejado: o playbook scout-then-build, com scout, plan, build e review. Embaixo, o que rodou: scout, plan, uma wave livre para corrigir o script de build porque o bug estava lá, build, e review riscado porque o diff tinha três linhas. O journal.jsonl registra cada mudança com o motivo, e o relatório mostra todas em Changes to the plan" width="820">
+    <source media="(prefers-color-scheme: dark)" srcset="./docs/assets/drawings/savings-dark.svg">
+    <img src="./docs/assets/drawings/savings-light.svg" alt="Dois gráficos de barras desenhados à mão. À esquerda: um worker Claude haiku na mesma tarefa de uma linha usou 76.160 tokens e US$ 0,16 na versão 11, e 38.157 tokens e US$ 0,08 na versão 12. À direita: numa execução real com dois workers, 5,0 KB de transcrições ficaram no disco e o líder leu 595 bytes de resultados" width="820">
   </picture>
 </p>
 
@@ -148,7 +180,7 @@ Qualquer outra CLI com modo não interativo, como Kiro, Copilot CLI ou Gemini CL
 > | `codex-low` | default Codex model at low effort | codex, default model, low | read | succeeded | 16s | 32,660 | - |
 
 <details>
-<summary>Comandos e arquivos</summary>
+<summary>Comandos do runner e arquivos</summary>
 
 O seu agente roda estes comandos por você, a partir de
 `skills/alethe-orchestrate/scripts/orchestrate.py`:
@@ -204,12 +236,6 @@ nos outros sistemas, com uma pasta por orquestração dentro de `orchestrations/
     </td>
   </tr>
 </table>
-
-## Desenvolvimento
-
-```sh
-python -m unittest discover -s tests
-```
 
 ## Licença
 
