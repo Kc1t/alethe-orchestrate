@@ -228,6 +228,79 @@ nos outros sistemas, com uma pasta por orquestração dentro de `orchestrations/
   </tr>
 </table>
 
+## Exemplo de Playbook
+
+`scout-then-build`: scouts baratos e só leitura mapeiam o código, depois um worker escreve a mudança.
+
+<p align="center">
+  <img src="./docs/assets/playbook-scout-then-build.png" alt="O playbook scout-then-build como fluxo: planner, quatro scouts, um checker quando discordam, planner, builder e um fixer quando as checagens falham" width="100%">
+</p>
+
+<details>
+<summary>O YAML por trás</summary>
+
+```yaml
+playbooks:
+  scout-then-build:
+    name: Scout, then build
+    goal: Cheap read-only scouts map the code; one standard worker writes the change.
+    pickWhen: Unfamiliar code with much to read and little to write.
+    saves: Scouts hand back short summaries instead of raw files filling your context.
+    avoidWhen: You already know which files change.
+    next: review-gate
+    phases:
+      - id: brief
+        role: planner
+        who: lead
+        tier: strong
+        readOnly: true
+        does: Name the areas to map and send one scout per area.
+      - id: scout
+        role: scout
+        tier: cheap
+        readOnly: true
+        workers: 4
+        runner: research
+        does: One area per scout; keep each slice well under 100K tokens.
+        returns: A summary under 1.5K tokens with file:line pointers.
+        gate: The scout reports agree.
+      - id: settle
+        role: checker
+        tier: standard
+        effort: high
+        readOnly: true
+        runner: economy
+        after: scout
+        if: conflict
+        then: recheck
+        does: Settle only the contradiction, from the cited lines.
+      - id: plan
+        role: planner
+        who: lead
+        tier: strong
+        readOnly: true
+        does: Turn the summaries into one concrete change plan.
+      - id: build
+        role: builder
+        tier: standard
+        readOnly: false
+        runner: economy
+        does: Implement the plan.
+        returns: Changed files, checks run, failures and risks.
+        gate: Checks pass.
+      - id: fix
+        role: fixer
+        tier: strong
+        readOnly: false
+        runner: economy
+        after: build
+        if: checks-failed
+        then: recheck
+        does: Fix from the failure excerpt and the diff.
+```
+
+</details>
+
 ## Licença
 
 MIT, veja [`LICENSE`](LICENSE). O nome e o logo **Alethe** e as marcas dos fornecedores pertencem aos donos. Parte do [Alethe](https://github.com/Kc1t/alethe-agents) · [Changelog](CHANGELOG.md) · [Issues](https://github.com/Kc1t/alethe-orchestrate-skill/issues)
