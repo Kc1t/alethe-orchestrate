@@ -12,7 +12,7 @@
 
   <p align="center">
     <a href="https://github.com/Kc1t/alethe-orchestrate-skill/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/Kc1t/alethe-orchestrate-skill/actions/workflows/ci.yml/badge.svg"></a>
-    <a href="./CHANGELOG.md"><img alt="Versão da skill" src="https://img.shields.io/badge/skill-v18-4f46e5?style=flat-square"></a>
+    <a href="./CHANGELOG.md"><img alt="Versão da skill" src="https://img.shields.io/badge/skill-v19-4f46e5?style=flat-square"></a>
     <a href="./LICENSE"><img alt="Licença" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square"></a>
     <img alt="Python 3.9+ opcional" src="https://img.shields.io/badge/python-3.9%2B%20optional-3776ab?style=flat-square&logo=python&logoColor=white">
     <img alt="Windows, macOS e Linux" src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-555?style=flat-square">
@@ -155,6 +155,10 @@ Qualquer outra CLI com modo não interativo, como Kiro, Copilot CLI ou Gemini CL
 </p>
 
 ## O Relatório
+
+`/alethe report html` abre o mesmo relatório como página: um mapa de roteamento de cada wave,
+passando pelo líder, até os provedores que ela usou, com a fatia de tokens de cada um, depois os
+workers e o que falta.
 
 > **Orchestration report**
 >

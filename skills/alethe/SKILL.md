@@ -3,7 +3,7 @@ name: alethe
 description: Orchestrate bounded Codex, Claude Code, Agy, Kimi, or custom CLI workers to finish work with the least lead context and provider usage, following playbooks such as plan big, execute small. Use when the user asks to orchestrate, delegate, compare agents, conserve agent tokens or quota, recover a worker, report what an orchestration did and cost, or work without MCP or Python, when the user types /alethe or a short command such as "alethe report" or "alethe stop", and when they want it on from now on, at any point of a task and alongside other skills. Also use it proactively, without being asked, when a request is large enough to split into bounded independent units, such as a multi-file refactor, a migration, an audit or research across many files. Do not use for a small mechanical task unless explicitly requested.
 argument-hint: "[task or standing instruction] | on | off | save | max | careful | report | status | usage | models | editor | list | stop | skip <phase> | switch <playbook> | freeform | budget <limit> | mark <worker> <used|partial|discarded> | setup | help"
 metadata:
-  version: "18"
+  version: "19"
 ---
 
 # Orchestrate CLI workers
@@ -76,6 +76,7 @@ action. Run-specific commands without a folder use the current orchestration: th
 | `save`, `balanced`, `max` | `mode on --goal <it>` |
 | `careful` | `mode on --care careful` |
 | `report [folder]` | `report`, and show its output as is, without a summary of your own |
+| `report html`, or "show the report" | `report --format html`, which writes `report.html` in the folder and opens it; without Python, fill `assets/report.html` as in [references/manual.md](references/manual.md) |
 | `status` | `status`, and show its output as is |
 | `usage` | `usage`, or `usage --refresh-claude` when Claude's reading is missing or stale; show windows, resets and freshness |
 | `models` | `models`; show model prices, ranks and price freshness |
@@ -232,7 +233,8 @@ does. Stop a wave that is no longer useful with `stop`; workers that already ran
    render it with `scripts/diagram.py` as described in [references/diagram.md](references/diagram.md).
    Show the SVG before running workers and use only confirmed proxy routes.
 7. Start the orchestration once with `scripts/orchestrate.py new "<title>" --playbook <name>
-   --why "<one line>"`; it creates the folder and makes it current. Start every wave with
+   --why "<one line>" --lead <your CLI>:<your model>`, such as `--lead claude:opus`; it creates the
+   folder, makes it current and names you as the lead in the report. Start every wave with
    `run <plan> --in current --detach`, then call `wait [--timeout N]` (at most 540 seconds) until
    `done` is true; it returns status too. Claude Code may instead use the shell tool's background
    mode. Never run a wave in the foreground of a shell tool with a short timeout. Interrupted

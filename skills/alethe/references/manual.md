@@ -139,6 +139,24 @@ Add the totals, what the spend bought, and what is left to review. Split non-cac
 reported cost between used, partial and discarded results; show cache reads separately. Show cost
 only where the CLI reported it; never turn the price table or a preview estimate into report spend.
 
+When the user wants the report as a page, write `<folder>/report.json` with what you counted and
+copy `assets/report.html` to `<folder>/report.html` with its line `__REPORT_JSON__` replaced by
+that JSON, through the shell as for the editor (`sed -e '/__REPORT_JSON__/{r report.json' -e 'd}'`).
+Write any `</` in it as `<\/`. The page computes totals and the split per provider, so each worker
+needs only what you know; use `null` for anything its CLI did not report:
+
+```json
+{"title": "Audit the auth module", "why": "...", "playbooks": ["audit-at-scale"],
+ "lead": {"provider": "claude", "model": "opus"},
+ "startedAt": "2026-10-23T13:00:00Z", "finishedAt": "2026-10-23T13:04:10Z",
+ "journal": [{"at": "2026-10-23T13:02:00Z", "kind": "skip", "text": "Skipped settle: the scouts agreed"}],
+ "runs": [{"phase": "audit", "why": "...", "status": "done", "startedAt": "2026-10-23T13:00:00Z",
+   "wallSeconds": 95, "workers": [{"id": "audit-a", "why": "...", "provider": "codex",
+   "model": null, "effort": "low", "mode": "read-only", "status": "succeeded",
+   "durationSeconds": 80, "tokens": 41000, "cachedTokens": null, "costUsd": null,
+   "summary": "...", "mark": "used"}]}]}
+```
+
 ## What you lose without the runner
 
 - No hard budget: count calls and reported tokens yourself after each wave and stop at the limit.

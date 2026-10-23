@@ -1211,6 +1211,21 @@ def write_editor(policy_path: Path, target: Optional[Path] = None) -> Dict[str, 
             "saveTo": str(user_playbooks_path(policy_path)), "liveUsage": sorted(usage)}
 
 
+REPORT_TEMPLATE = EDITOR_TEMPLATE.with_name("report.html")
+REPORT_PAGE_FILE = "report.html"
+REPORT_SLOT = "\n__REPORT_JSON__\n"
+
+
+def write_report_page(report: Dict[str, Any], target: Path) -> Path:
+    page = read_playbooks(REPORT_TEMPLATE)
+    if page.count(REPORT_SLOT) != 1:
+        raise PlanError(f"the report template at {REPORT_TEMPLATE} has no {REPORT_SLOT.strip()} slot")
+    data = json.dumps(report, ensure_ascii=False).replace("</", "<\\/")
+    path = target.expanduser().resolve()
+    atomic_write_text(path, page.replace(REPORT_SLOT, "\n" + data + "\n", 1))
+    return path
+
+
 def open_page(path: Path) -> bool:
     try:
         if os.name == "nt":
@@ -3674,12 +3689,32 @@ def next_wave_dir(folder: Path, phase: Any) -> Path:
     return folder / f"{len(numbered) + 1:02d}-{slugify(phase if isinstance(phase, str) else '', 'wave')}"
 
 
-def new_orchestration(title: str, playbook: Optional[str], why: Optional[str]) -> Dict[str, Any]:
+def lead_identity(spec: Optional[str]) -> Optional[Dict[str, Any]]:
+    if spec:
+        provider, _, model = spec.partition(":")
+        return {"provider": optional_name(provider.lower(), "--lead"), "model": optional_name(model or None, "--lead model"),
+                "effort": None, "source": "flag"}
+    if os.environ.get("CLAUDECODE") == "1":
+        effort = os.environ.get("CLAUDE_EFFORT") or None
+        return {"provider": "claude", "model": None,
+                "effort": effort if effort and SAFE_NAME_PATTERN.fullmatch(effort) else None, "source": "environment"}
+    return None
+
+
+def lead_text(lead: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not lead:
+        return None
+    detail = ", ".join(str(part) for part in (lead.get("model"), lead.get("effort")) if part)
+    return f"{lead.get('provider')} ({detail})" if detail else str(lead.get("provider"))
+
+
+def new_orchestration(title: str, playbook: Optional[str], why: Optional[str], lead: Optional[str] = None) -> Dict[str, Any]:
     meta = {
         "version": 1,
         "title": optional_note(require_string(title, "title"), "title", NOTE_LIMITS["title"]),
         "playbook": optional_name(playbook, "playbook"),
         "why": optional_note(why, "why", NOTE_LIMITS["why"]),
+        "lead": lead_identity(lead),
         "createdAt": now_iso(),
     }
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -4686,6 +4721,7 @@ def build_report(run_dirs: Sequence[Path], folder: Optional[Path] = None) -> Dic
         "title": titles[0] if titles else None,
         "playbooks": playbooks,
         "why": meta.get("why"),
+        "lead": meta.get("lead") if isinstance(meta.get("lead"), dict) else None,
         "journal": read_journal(folder),
         "startedAt": runs[0]["startedAt"] if runs else None,
         "finishedAt": max((run["finishedAt"] or "" for run in runs), default="") or None,
@@ -4923,6 +4959,8 @@ def render_markdown(report: Dict[str, Any]) -> str:
             span += finished.strftime(" to %H:%M" if finished.date() == started.date() else " to %Y-%m-%d %H:%M")
         heading.append(span)
     lines += [", ".join(heading), ""]
+    if lead_text(report["lead"]):
+        lines += [f"Lead: {cell(lead_text(report['lead']))} planned the waves and wrote the prompts", ""]
     if report["why"]:
         lines += [f"Why: {cell(report['why'])}", ""]
     elif len(runs) == 1 and runs[0]["why"]:
@@ -5112,6 +5150,8 @@ def render_status(report: Dict[str, Any]) -> str:
     if report["playbooks"]:
         head.append("playbook " + ", ".join(report["playbooks"]))
     head.append(counted(totals["runs"], "wave"))
+    if lead_text(report["lead"]):
+        head.append("lead " + lead_text(report["lead"]))
     lines = [" | ".join(head)]
     waves = []
     for index, run in enumerate(report["runs"], 1):
@@ -5437,8 +5477,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         type=Path,
         help="run directories, or a folder holding one per wave; defaults to the latest run",
     )
-    report_parser.add_argument("--format", choices=["markdown", "json"], default="markdown")
-    report_parser.add_argument("--write", type=Path, help="also save the report to this file")
+    report_parser.add_argument("--format", choices=["markdown", "json", "html"], default="markdown")
+    report_parser.add_argument(
+        "--write", type=Path, help=f"also save the report to this file; html defaults to {REPORT_PAGE_FILE} in the folder"
+    )
+    report_parser.add_argument("--no-open", action="store_true", help="with --format html, write the page without opening it")
     status_parser = subparsers.add_parser(
         "status", help="print a few lines on where an orchestration stands, to pick it up again"
     )
@@ -5452,6 +5495,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     new_parser.add_argument("title")
     new_parser.add_argument("--playbook")
     new_parser.add_argument("--why")
+    new_parser.add_argument("--lead", help="the CLI and model leading it, as provider:model, such as claude:opus")
     list_parser = subparsers.add_parser("list", help="list recent orchestrations; * marks the current one")
     list_parser.add_argument("--limit", type=int, default=10)
     list_parser.add_argument("--format", choices=["text", "json"], default="text")
@@ -5552,7 +5596,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(json.dumps(doctor_payload(policy_path), indent=2, ensure_ascii=False))
             return 0
         if args.command == "report":
-            report = build_report(*report_target(args.runs))
+            runs, folder = report_target(args.runs)
+            report = build_report(runs, folder)
+            if args.format == "html":
+                path = write_report_page(report, args.write or (folder or runs[-1]) / REPORT_PAGE_FILE)
+                opened = not args.no_open and open_page(path)
+                print(json.dumps({"path": str(path), "opened": opened}, indent=2))
+                return 0
+            if args.no_open:
+                raise PlanError("--no-open only applies to --format html")
             if args.format == "json":
                 text = json.dumps(report, indent=2, ensure_ascii=False) + "\n"
             else:
@@ -5574,7 +5626,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(json.dumps(wait_payload(args.folder, args.timeout), indent=2, ensure_ascii=False))
             return 0
         if args.command == "new":
-            print(json.dumps(new_orchestration(args.title, args.playbook, args.why), indent=2, ensure_ascii=False))
+            print(json.dumps(new_orchestration(args.title, args.playbook, args.why, args.lead), indent=2, ensure_ascii=False))
             return 0
         if args.command == "list":
             entries = list_payload(max(1, args.limit))

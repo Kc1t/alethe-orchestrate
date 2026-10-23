@@ -263,7 +263,7 @@ function parsePlaybooksYaml(text) {
   const space = (ch) => ch !== undefined && /\s/.test(ch)
   const isItem = (t) => t === '-' || t.startsWith('- ')
   const isQuote = (ch) => ch === '"' || ch === "'"
-  const ESCAPES = { 0: '\0', a: '\x07', b: '\b', t: '\t', n: '\n', v: '\v', f: '\f', r: '\r', e: '\x1b', ' ': ' ', '"': '"', '/': '/', '\\': '\\', N: '\x85', _: '\xa0', L: ' ', P: ' ' }
+  const ESCAPES = { 0: '\0', a: '\x07', b: '\b', t: '\t', n: '\n', v: '\v', f: '\f', r: '\r', e: '\x1b', ' ': ' ', '"': '"', '/': '/', '\\': '\\', N: '\x85', _: '\xa0', L: '\u2028', P: '\u2029' }
   const put = (target, key, value, line) => {
     if (key === '__proto__') fail(line, 'the key __proto__ is reserved')
     if (hasKey(target, key)) fail(line, `duplicate mapping key '${key}'`)

@@ -90,8 +90,10 @@ subscription bill. The report continues to show only metrics the CLIs reported.
 ## The current orchestration
 
 `new "<title>"` creates an orchestration folder under `orchestrations/` next to the saved policy
-(`ALETHE_ORCHESTRATE_HOME` overrides it), saves the title, playbook and why in
-`orchestration.json`, and makes it current. `run <plan> --in current` adds the next wave as
+(`ALETHE_ORCHESTRATE_HOME` overrides it), saves the title, playbook, why and lead in
+`orchestration.json`, and makes it current. `--lead provider:model` names the CLI and model that
+plan and write the prompts; without it the runner records Claude Code when it runs inside one, with
+no model, since Claude Code does not expose it. `report` and `status` show the lead. `run <plan> --in current` adds the next wave as
 `<NN>-<phase>`, so `report` reads every wave together.
 
 Start every wave with `run <plan> --in current --detach`; it returns at once. Then call
@@ -335,6 +337,13 @@ context" compares the transcripts that stayed on disk with the results the lead 
 "Left to do" also lists workers that succeeded but said they were blocked or had concerns, got a
 FAIL or NOT_PROVEN verdict, wrote while read-only, or had tool calls denied, each with what to do
 next. With a folder budget, the report adds what every wave used against it.
+
+`--format html` writes the same report as one offline page, `report.html` in the orchestration
+folder (or the latest run, or `--write <file>`), and opens it; `--no-open` only writes it. The page
+shows the totals in one line, a routing map from each wave through the lead to the providers it
+used, where line width and percent follow each provider's share of reported tokens, the plan
+changes, a worker table whose rows open their details, and what is left to do. It embeds the JSON
+report and adds nothing to it.
 
 `mark [folder] <worker> used|partial|discarded [--why TEXT]` records whether you kept a worker's
 result. Once any result is marked, the report adds a **Value** line that splits the reported cost

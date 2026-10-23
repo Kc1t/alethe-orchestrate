@@ -3,6 +3,23 @@
 The version is the integer in `skills/alethe/SKILL.md` under `metadata.version`.
 Alethe installs and updates the skill by that number.
 
+## 19 (2026-10-23)
+
+Added:
+
+- `report --format html` (`/alethe report html`) writes the report as one offline page in the
+  orchestration folder and opens it: the totals in one line, a routing map from each wave through
+  the lead to the providers it used with each one's share of the tokens, the plan changes, the
+  workers, and what is left to do. Without Python the lead fills `assets/report.html` with the
+  JSON it counted, and the page works out the totals.
+- `new --lead provider:model` records which CLI and model lead the orchestration, the one that
+  plans and writes the prompts. Without it, a lead running in Claude Code is detected. `report`,
+  `status` and the report page show it, the page at the center of its routing map.
+
+Fixed:
+
+- The editor's YAML reader no longer holds two invisible line-separator characters in its source.
+
 ## 18 (2026-10-23)
 
 Added:
