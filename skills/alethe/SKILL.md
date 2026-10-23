@@ -1,9 +1,9 @@
 ---
 name: alethe
 description: Orchestrate bounded Codex, Claude Code, Agy, Kimi, or custom CLI workers to finish work with the least lead context and provider usage, following playbooks such as plan big, execute small. Use when the user asks to orchestrate, delegate, compare agents, conserve agent tokens or quota, recover a worker, report what an orchestration did and cost, or work without MCP or Python, when the user types /alethe or a short command such as "alethe report" or "alethe stop", and when they want it on from now on, at any point of a task and alongside other skills. Also use it proactively, without being asked, when a request is large enough to split into bounded independent units, such as a multi-file refactor, a migration, an audit or research across many files. Do not use for a small mechanical task unless explicitly requested.
-argument-hint: "[task or standing instruction] | on | off | save | max | careful | report | status | usage | models | list | stop | skip <phase> | switch <playbook> | freeform | budget <limit> | mark <worker> <used|partial|discarded> | setup | help"
+argument-hint: "[task or standing instruction] | on | off | save | max | careful | report | status | usage | models | editor | list | stop | skip <phase> | switch <playbook> | freeform | budget <limit> | mark <worker> <used|partial|discarded> | setup | help"
 metadata:
-  version: "17"
+  version: "18"
 ---
 
 # Orchestrate CLI workers
@@ -79,6 +79,7 @@ action. Run-specific commands without a folder use the current orchestration: th
 | `status` | `status`, and show its output as is |
 | `usage` | `usage`, or `usage --refresh-claude` when Claude's reading is missing or stale; show windows, resets and freshness |
 | `models` | `models`; show model prices, ranks and price freshness |
+| `editor`, or "show the playbooks" | `editor`, which writes the playbooks as a flow page and opens it; without Python, fill `assets/editor.html` as in [references/manual.md](references/manual.md) |
 | `list` | `list`; `use <folder>` makes one of them current again |
 | `stop` | `stop`, then `status` once the waves have ended |
 | `budget <limit>` | `budget --max-calls N`, `--max-reported-cost-usd C` or `--max-reported-tokens T` |

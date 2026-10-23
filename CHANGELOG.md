@@ -3,6 +3,16 @@
 The version is the integer in `skills/alethe/SKILL.md` under `metadata.version`.
 Alethe installs and updates the skill by that number.
 
+## 18 (2026-10-23)
+
+Added:
+
+- `editor` (`/alethe editor`) writes the playbooks as one offline flow page and opens it: each
+  playbook as a flowchart with its conditions, fallbacks and resolved models, profile switches, the
+  latest quota readings as the `now` preset, simulated quota, and YAML to copy or download after an
+  edit. The page reads the YAML itself, so without Python the lead fills `assets/editor.html` from
+  the shell.
+
 ## 17 (2026-10-22)
 
 Added:

@@ -1164,6 +1164,68 @@ def usage_payload(policy_path: Path, refresh: bool = True, now: Optional[dt.date
             "cachePath": str(policy_path.with_name(USAGE_FILE)), "providers": providers}
 
 
+EDITOR_TEMPLATE = Path(__file__).resolve().parent.parent / "assets" / "editor.html"
+EDITOR_FILE = "alethe-playbooks.html"
+EDITOR_PLAYBOOKS_SLOT = "\n__PLAYBOOKS_YAML__\n"
+EDITOR_USAGE_SLOT = '<script type="application/json" id="live-usage">{}</script>'
+EDITOR_WINDOWS = {"claude": {"5h": "short", "week": "week", "opus": "opus"}, "codex": {"5h": "short", "week": "week"}}
+
+
+def editor_usage(usage: Dict[str, Any], providers: Sequence[str], now: Optional[dt.datetime] = None) -> Dict[str, Any]:
+    current = now or dt.datetime.now(dt.timezone.utc)
+    live = {}
+    for provider, keys in EDITOR_WINDOWS.items():
+        reading = usage["providers"].get(provider, {})
+        if provider not in providers or reading.get("missing", True):
+            continue
+        windows = reading["windows"]
+        entry: Dict[str, Any] = {key: round(windows[name]["usedPercent"]) if name in windows else 0 for name, key in keys.items()}
+        week = windows.get("week")
+        reset = timestamp(week["resetsAt"]) if week and not week["reset"] else None
+        entry["reset"] = max(1, math.ceil((reset - current).total_seconds() / 3600)) if reset else None
+        entry["expires"] = None
+        live[provider] = entry
+    return live
+
+
+def script_safe(text: str) -> str:
+    return re.sub(r"</(script)", r"<\\/\1", text, flags=re.IGNORECASE)
+
+
+def write_editor(policy_path: Path, target: Optional[Path] = None) -> Dict[str, Any]:
+    text, parsed = loaded_playbooks(policy_path)
+    try:
+        usage = editor_usage(usage_payload(policy_path), parsed.get("providers", []))
+    except PlanError:
+        # a broken usage cache only drops the live quota preset
+        usage = {}
+    page = read_playbooks(EDITOR_TEMPLATE)
+    for slot in (EDITOR_PLAYBOOKS_SLOT, EDITOR_USAGE_SLOT):
+        if page.count(slot) != 1:
+            raise PlanError(f"the editor template at {EDITOR_TEMPLATE} has no {slot.strip()} slot")
+    page = page.replace(EDITOR_PLAYBOOKS_SLOT, "\n" + script_safe(text.rstrip("\n")) + "\n", 1)
+    page = page.replace(EDITOR_USAGE_SLOT, EDITOR_USAGE_SLOT.replace("{}", script_safe(json.dumps(usage))), 1)
+    path = (target or policy_path.with_name(EDITOR_FILE)).expanduser().resolve()
+    atomic_write_text(path, page)
+    return {"path": str(path), "playbooks": str(effective_playbooks_path(policy_path)),
+            "saveTo": str(user_playbooks_path(policy_path)), "liveUsage": sorted(usage)}
+
+
+def open_page(path: Path) -> bool:
+    try:
+        if os.name == "nt":
+            os.startfile(str(path))
+            return True
+        opener = shutil.which("open" if sys.platform == "darwin" else "xdg-open")
+        if not opener:
+            return False
+        subprocess.Popen([opener, str(path)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+        return True
+    except OSError:
+        return False
+
+
 def worker_windows(worker: Dict[str, Any]) -> Tuple[str, ...]:
     if worker["provider"] == "claude" and "opus" in str(worker.get("model") or "").lower():
         return (*MAIN_QUOTA_WINDOWS, "opus")
@@ -5316,6 +5378,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     playbook_parser.add_argument("--path", action="store_true", help="print only the effective file path")
     playbook_parser.add_argument("--init", action="store_true", help="copy the bundled playbooks for editing")
     playbook_parser.add_argument("--force", action="store_true", help="with --init, replace an existing copy")
+    editor_parser = subparsers.add_parser(
+        "editor", help="write the playbooks as an interactive HTML flow editor and open it"
+    )
+    editor_parser.add_argument("--policy", type=Path)
+    editor_parser.add_argument("--out", type=Path, help=f"where to write the page; default {EDITOR_FILE} next to the policy")
+    editor_parser.add_argument("--no-open", action="store_true", help="write the page without opening a browser")
     probe_parser = subparsers.add_parser("probe", help="report available built-in providers")
     probe_parser.add_argument("providers", nargs="*", choices=["codex", "claude", "agy", "kimi"])
     doctor_parser = subparsers.add_parser("doctor", help="check the environment and saved policy")
@@ -5461,6 +5529,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 print(str(path))
                 return 0
             print(playbook_output(policy_path, args.id, args.pick, args.json))
+            return 0
+        if args.command == "editor":
+            policy_path = (args.policy or default_policy_path()).expanduser().resolve()
+            payload = write_editor(policy_path, args.out)
+            payload["opened"] = not args.no_open and open_page(Path(payload["path"]))
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
             return 0
         if args.command == "probe":
             providers = args.providers or ["codex", "claude", "agy", "kimi"]

@@ -12,7 +12,7 @@
 
   <p align="center">
     <a href="https://github.com/Kc1t/alethe-orchestrate-skill/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/Kc1t/alethe-orchestrate-skill/actions/workflows/ci.yml/badge.svg"></a>
-    <a href="./CHANGELOG.md"><img alt="Versão da skill" src="https://img.shields.io/badge/skill-v17-4f46e5?style=flat-square"></a>
+    <a href="./CHANGELOG.md"><img alt="Versão da skill" src="https://img.shields.io/badge/skill-v18-4f46e5?style=flat-square"></a>
     <a href="./LICENSE"><img alt="Licença" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square"></a>
     <img alt="Python 3.9+ opcional" src="https://img.shields.io/badge/python-3.9%2B%20optional-3776ab?style=flat-square&logo=python&logoColor=white">
     <img alt="Windows, macOS e Linux" src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-555?style=flat-square">
@@ -179,7 +179,7 @@ O seu agente roda estes comandos por você, a partir de
 
 | Etapa | Comando | O que faz |
 | --- | --- | --- |
-| Setup | `doctor`, `playbook`, `policy`, `mode` | Confere as CLIs, mostra ou edita playbooks e preferências, deixa ligado |
+| Setup | `doctor`, `playbook`, `editor`, `policy`, `mode` | Confere as CLIs, mostra, abre ou edita playbooks e preferências, deixa ligado |
 | Plano | `scaffold`, `validate`, `dry-run` | Cria, valida e mostra a prévia de um plano |
 | Execução | `new`, `run --in current`, `budget`, `note`, `stop` | Roda as waves de uma orquestração |
 | Depois | `status`, `mark`, `report`, `list`, `use` | Explica e avalia o que rodou |
@@ -232,6 +232,8 @@ nos outros sistemas, com uma pasta por orquestração dentro de `orchestrations/
 ## Exemplo de Playbook
 
 `scout-then-build`: scouts baratos e só leitura mapeiam o código, depois um worker escreve a mudança.
+`/alethe editor` abre os seus playbooks assim, numa página offline onde você troca de perfil,
+simula a cota e edita um passo, depois copia o YAML de volta. Funciona também sem Python.
 
 <p align="center">
   <img src="./docs/assets/playbook-scout-then-build.png" alt="O playbook scout-then-build como fluxo: planner, quatro scouts, um checker quando discordam, planner, builder e um fixer quando as checagens falham" width="100%">

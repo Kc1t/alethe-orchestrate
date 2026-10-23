@@ -145,6 +145,14 @@ only where the CLI reported it; never turn the price table or a preview estimate
 - No automatic `dry-run`: estimate prompt tokens as task characters divided by four. A dollar
   estimate may use verified prices only; label it a list-price estimate, never actual spend.
 - No `diagram.py`: draw the plan as a Mermaid flowchart when the user wants to see it.
+- No `editor`: copy `assets/editor.html` and replace its line `__PLAYBOOKS_YAML__` with the full
+  text of the effective playbooks file (the user's `alethe-playbooks.yaml` next to the policy, else
+  the bundled `playbooks.yaml`), writing any `</script` in it as `<\/script`. Use the shell rather
+  than reading the 180 KB page: `sed -e '/__PLAYBOOKS_YAML__/{r <yaml>' -e 'd}' <template> > <page>`,
+  or in PowerShell `(Get-Content -Raw <template>).Replace('__PLAYBOOKS_YAML__', (Get-Content -Raw
+  <yaml>)) | Set-Content <page>`. Optionally put the quota you read in the `live-usage` block, as
+  `{"claude": {"short": 26, "week": 69, "opus": 0, "reset": 49}}` (percent used; `reset` is hours
+  until the weekly window resets). Open the page; a red line at the top names a YAML error.
 - No Windows `.cmd` shim handling: run the commands through your own shell, which handles the shim,
   and keep newlines and quotes inside `task.md` rather than in arguments.
 - No `status` or `mark`: keep `<folder>/state.md` with one line per worker (id, phase, status,

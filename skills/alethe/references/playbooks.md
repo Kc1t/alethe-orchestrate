@@ -9,6 +9,18 @@ Plain `playbook` prints the whole effective file for editing and onboarding only
 replaces the bundled file. `playbook --init` copies it next to the saved policy; delete the copy
 to restore defaults. `doctor` validates the copy. See [onboarding.md](onboarding.md) for setup.
 
+## See and edit the playbooks
+
+`editor` writes the effective playbooks as a flow page, `alethe-playbooks.html` next to the policy
+(or `--out <file>`), and opens it (`--no-open` only writes it). Each playbook is a flowchart with
+its conditions, fallbacks and the model each step resolves to under the chosen profile. The page
+starts from the latest quota readings as the `now` usage preset; the other presets and sliders
+only simulate. Task, checks and budget switches show which branch runs. Edits stay in the page
+until the user copies or downloads the YAML; save it over the user's copy and run `doctor` before
+the next plan. The page is one offline file and reads the YAML itself, so it needs no Python: see
+[manual.md](manual.md). It shows the playbooks; to show one plan's workers, use
+[diagram.md](diagram.md).
+
 ## Top level
 
 | Field | Meaning |

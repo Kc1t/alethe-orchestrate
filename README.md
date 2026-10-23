@@ -12,7 +12,7 @@
 
   <p align="center">
     <a href="https://github.com/Kc1t/alethe-orchestrate-skill/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/Kc1t/alethe-orchestrate-skill/actions/workflows/ci.yml/badge.svg"></a>
-    <a href="./CHANGELOG.md"><img alt="Skill version" src="https://img.shields.io/badge/skill-v17-4f46e5?style=flat-square"></a>
+    <a href="./CHANGELOG.md"><img alt="Skill version" src="https://img.shields.io/badge/skill-v18-4f46e5?style=flat-square"></a>
     <a href="./LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square"></a>
     <img alt="Python 3.9+ optional" src="https://img.shields.io/badge/python-3.9%2B%20optional-3776ab?style=flat-square&logo=python&logoColor=white">
     <img alt="Windows, macOS and Linux" src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-555?style=flat-square">
@@ -178,7 +178,7 @@ Your agent runs these for you, from `skills/alethe/scripts/orchestrate.py`:
 
 | Stage | Command | What it does |
 | --- | --- | --- |
-| Setup | `doctor`, `playbook`, `policy`, `mode` | Checks the CLIs, prints or edits the playbooks and preferences, keeps it on |
+| Setup | `doctor`, `playbook`, `editor`, `policy`, `mode` | Checks the CLIs, prints, shows or edits the playbooks and preferences, keeps it on |
 | Plan | `scaffold`, `validate`, `dry-run` | Starts, checks and previews a plan |
 | Run | `new`, `run --in current`, `budget`, `note`, `stop` | Runs the waves of one orchestration |
 | After | `status`, `mark`, `report`, `list`, `use` | Explains and values what ran |
@@ -231,6 +231,8 @@ elsewhere, with one folder per orchestration under `orchestrations/`:
 ## Example Playbook
 
 `scout-then-build`: cheap read-only scouts map the code, then one worker writes the change.
+`/alethe editor` opens your own playbooks this way, as one offline page where you can switch
+profiles, simulate quota and edit a step, then copy the YAML back. It works without Python too.
 
 <p align="center">
   <img src="./docs/assets/playbook-scout-then-build.png" alt="The scout-then-build playbook as a flow: planner, four scouts, a checker when they disagree, planner, builder, and a fixer when checks fail" width="100%">
