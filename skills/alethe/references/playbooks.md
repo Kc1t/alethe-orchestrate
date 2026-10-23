@@ -1,9 +1,13 @@
 # Playbook file reference
 
-`scripts/orchestrate.py playbook` prints the effective playbooks file. This page explains its
-fields so the lead can follow it and the user can edit it. `playbook --init` copies the bundled
-file next to the saved policy for editing; delete that copy to return to the bundled defaults.
-Onboarding fills that copy from what the user has; see [onboarding.md](onboarding.md).
+Run `scripts/orchestrate.py playbook --pick` before planning. It prints the active profile and
+provider order, one line per `pickOrder` entry, and each playbook's id, name and `pickWhen`.
+Then `playbook <id>` prints only that playbook, the resolved active tiers (provider and tier to
+model/effort), provider order, quota and budget rules. Both accept `--json`.
+
+Plain `playbook` prints the whole effective file for editing and onboarding only. The user's copy
+replaces the bundled file. `playbook --init` copies it next to the saved policy; delete the copy
+to restore defaults. `doctor` validates the copy. See [onboarding.md](onboarding.md) for setup.
 
 ## Top level
 
@@ -17,6 +21,7 @@ Onboarding fills that copy from what the user has; see [onboarding.md](onboardin
 | `routes` | Gateways on the model traffic path, such as `router9` |
 | `tiers` | What `cheap`, `standard` and `strong` mean per provider: a model and an effort |
 | `quota.criticalThreshold` | Percent of any main usage window that counts as low on tokens |
+| `quota.stopAt` | Percent at which `run` refuses a wave and skips queued workers on that provider; at least `criticalThreshold`, 95 by default |
 | `quota.whenLow` | `switch-provider` runs a role on the next provider in the order at the same tier; `keep` stays |
 | `quota.onBothCritical` | `ask`, `run-cheapest` or `block` when every provider in the order is low |
 | `quota.whenSpare` | What to do with a provider's spare quota: `spend-strong` runs workers on its strong tier, `prefer` runs them on it at their own tier, `ignore` changes nothing |
@@ -62,7 +67,9 @@ The active profile changes three things and leaves the playbooks alone:
 | `tiers` | Overrides the model and effort of the tier and provider entries it names |
 
 `base` usually has no overrides. Switch profiles by changing `profile`, after confirming when it is
-an ongoing change rather than one run.
+an ongoing change rather than one run. All three tiers (`cheap`, `standard`, `strong`) resolve from
+`tiers` plus the active profile's overrides. Deprecated `policy.modelTiers` overrides still win
+when set; `policy set --cheap-model` is a legacy path, not where onboarding writes new tiers.
 
 ## Phases
 
@@ -76,10 +83,10 @@ A playbook lists `phases`. Each phase is one role:
 | `tier` | `cheap`, `standard` or `strong`, resolved through the active tiers |
 | `provider` | `auto` (default) takes the first provider in the active order that can run the phase; a provider id pins it |
 | `model`, `effort` | Override the tier for this phase |
-| `readOnly` | Run workers with `mode: read` |
+| `readOnly` | Run workers with `mode: read-only` |
 | `workers` | Units in the wave, within the runner's limit |
 | `isolate` | Give each writer its own worktree |
-| `runner` | The plan `strategy` for the wave: `economy`, `balanced`, `quality`, `research`, `parallel` or `rescue` |
+| `runner` | The plan's runner strategy (`strategy`) for the wave: `economy`, `balanced`, `quality`, `research`, `parallel` or `rescue` |
 | `does`, `returns`, `limit` | What to put in each brief and what to ask back |
 | `gate` | What you check after the phase before moving on |
 | `if` | The phase runs only when the condition holds |
@@ -95,16 +102,26 @@ For each worker:
 1. Start from the phase's tier and provider, with the active profile's tiers and order.
 2. Apply the first rule whose `if` holds. Skip a rule whose model belongs to a different provider
    unless it also names that provider.
-3. If the provider it lands on is low on tokens and `quota.whenLow` is `switch-provider`, move to the
-   next provider in the order that can run the phase, at the same tier and effort. A rule that
-   names a provider keeps it.
-4. If every provider is low, follow `quota.onBothCritical`.
-5. If a provider has spare quota, apply `quota.whenSpare` to the worker. Skip this when the budget
-   is low, when the chosen rule has a quota or budget condition, or when the phase or rule pins a
-   different provider. When several are spare, use the one that loses its quota first.
+3. Before every wave run `usage`. If the chosen provider is low, move to the next capable provider
+   in the active order at the same tier, resolving that provider's model and effort. Respect a
+   provider the user pinned; a playbook's suggested provider does not prevent adapting the plan.
+   Never lower a tier to dodge a low provider; ask the user instead.
+4. If every provider is low, follow `quota.onBothCritical`. If the `dry-run` forecast passes
+   `quota.stopAt`, ask the user whatever `onBothCritical` says.
+5. Apply `quota.whenSpare` when unused quota would be lost, under every goal, profile and runner
+   strategy. Goal `save` is not required. Keep budget limits and user provider pins; when
+   several providers have spare quota, prefer the one that loses it first.
 
-Always pass the resulting model and effort explicitly in the plan. A worker without them runs on its
-CLI's default model.
+Change the plan before launching; these are lead decisions, not automatic live quota routing by
+the runner. The runner only enforces `quota.stopAt`: it refuses a wave on a provider at or past it
+and skips queued workers once a running wave crosses it, unless the user agreed to
+`run --allow-low-quota`. Tell the user at most one quota line per wave with the readings and reset time, and
+record it with `note "<reason and readings>" --kind switch`. Say when a reading is stale rather
+than asserting its number. `quota.whenLow: keep` remains a file setting; the skill's pre-wave
+check still calls for adapting an unpinned low-provider plan.
+
+Pass the resolved model and effort explicitly. If a model remains empty, the CLI uses its default;
+both `validate` and `dry-run` warn even when an effort is set.
 
 ## Usage windows
 
@@ -118,15 +135,33 @@ CLI's default model.
 | `copilot` | `premium` | monthly premium requests |
 | `gemini` | `day` | none |
 
-Alethe reads Claude, Codex, Antigravity and Kimi usage. For the others, ask the user, or treat the
-provider as not low.
+`usage` reads Claude quota from each Claude worker's `rate_limit_event`, as fresh as the last
+Claude worker, and Codex quota from its own session files, freshly read without starting a worker.
+`usage --refresh-claude` reads Claude now with a one-line Haiku call. None needs Alethe. Readings
+are cached in `alethe-usage.json` next to the policy; `status` and `doctor` show summaries, and
+`dry-run` warns for each worker on a low provider.
+
+Each provider/window reports `usedPercent`, `resetsAt`, `ageMinutes`, `low` (at or above
+`quota.criticalThreshold`), `blocked` (at or above `quota.stopAt`), `stale` (>30 minutes), and
+`reset`. Use the active profile's thresholds. Within a window usage only grows, so a stale reading
+still blocks until its `resetsAt` passes. Claude's `opus` window blocks only Opus workers.
+
+After each wave the runner records what each worker took of each window it can compare, in the
+same window before and after, as a sample in `alethe-usage.json` (the last 40 are kept). Samples
+include anything else that used the account during the wave, so they overstate rather than
+understate. `dry-run` turns the recent ones into `quotaForecast`: the median per worker of the same
+model, or of the provider when the model has fewer than two, summed over the wave's workers. Fewer
+than two samples leave it unknown.
+Antigravity and Kimi readings still need Alethe or the user; other providers need the user.
+Missing or stale data is unknown, not evidence of spare quota or available capacity.
 
 ## Spare quota
 
 A provider's quota is spare when it is not low, at least `spareMinLeft` percent of its cycle is
 left, and that quota would be lost: its plan ends before the cycle resets, or the cycle resets
 within `spareWithinHours`. A plan that ends in 2 days while the week resets in 6 loses everything
-left, so spending it on the strong tier costs nothing.
+left. For subscription billing, spending that quota does not add an API charge; API billing still
+incurs the model's price. See [operations.md](operations.md) for billing and price rules.
 
 ## Conditions
 
@@ -139,10 +174,10 @@ negate it. `<provider>` is any provider id and `<window>` one of its windows abo
 | `risky` | The unit changes an API contract, a database schema or migration, authentication, cryptography or secrets, or deletes data. Judge it by the operation, not by a word such as "auth" in the brief |
 | `kind:<kind>` | The unit's kind is `research`, `code`, `review`, `command`, `scrap` or `docs` |
 | `light`, `standard`, `deep` | The unit's effort class |
-| `<provider>-low` | A main window of that provider is past `criticalThreshold`, it is listed in `conserveProviders`, or the user said its tokens are running out |
+| `<provider>-low` | A fresh `usage` main window is at or above `criticalThreshold`, it is listed in `conserveProviders`, or Alethe or the user reports it low |
 | `all-low` | Every provider in the order is low; `both-low` means the same |
-| `<provider>-above:<n>` | The busiest main window of that provider is past n percent |
-| `<provider>-<window>-above:<n>` | That window is past n percent, for example `claude-opus-above:50` or `codex-week-above:80` |
+| `<provider>-above:<n>` | The busiest main window in a fresh reading is past n percent |
+| `<provider>-<window>-above:<n>` | That window in a fresh reading is past n percent, for example `claude-opus-above:50` or `codex-week-above:80` |
 | `<provider>-spare` | That provider has spare quota |
 | `budget-low` | More than `budget.warnAt` percent of the plan budget is spent |
 | `checks-failed`, `checks-failed-twice` | The phase's checks failed once, or twice |
@@ -152,7 +187,10 @@ negate it. `<provider>` is any provider id and `<window>` one of its windows abo
 | `no-pass` | No attempt passed |
 | `findings-left` | Confirmed review findings remain |
 
-In skill-only mode no live quota reading exists. Treat a provider as low only when Alethe reported
-it, the user said so, or the policy lists it in `conserveProviders`. Treat it as spare only when
-Alethe or the user gave its usage and reset time, and the plan end comes from `quota.planEnds` or
-the user. Ignore a `planEnds` date that has passed.
+In skill-only mode Claude and Codex quota conditions use fresh `usage` readings. Their extra
+windows apply only when reported. For Antigravity and Kimi, quota conditions still need Alethe or
+the user; for other providers, ask the user. A stale or absent reading cannot establish an
+`above` or `spare` condition. `conserveProviders` and explicit user warnings still establish low.
+Spare quota also needs a reset time; a non-renewing plan end comes from `quota.planEnds` or the
+user. Ignore a `planEnds` date that has passed. Task, check and report conditions are judged by
+the lead from evidence; budget conditions use the plan's recorded spend.

@@ -1,7 +1,8 @@
 # Provider adapters
 
 Read this reference when choosing a provider, resuming a worker, or defining a custom adapter. The
-runner uses argument arrays and never passes commands through a shell.
+runner uses argument arrays. An unreadable `.cmd` shim runs through `cmd.exe` only under the
+argument restrictions in the Windows section below.
 
 ## Built-in adapters
 
@@ -49,8 +50,9 @@ external deadline even when a provider also offers its own timeout.
   workers skip the startup time and the tool definitions of every server the user configured. In
   one check, a one-line Claude haiku answer took about half the tokens this way. Set `mcp: true` on
   a worker whose brief needs a server.
-- **Overspending.** A Claude worker gets the reported-cost budget left for it as `--max-budget-usd`,
-  so Claude stops it once it has spent that much, after the call that crosses the line.
+- **Overspending.** When the installed CLI supports `--max-budget-usd`, a Claude worker gets the
+  reported-cost budget left for it through that flag and stops after the call that crosses it.
+  Without that flag, the runner's reported-cost gate can only prevent later workers from starting.
 
 Claude `acceptEdits` does not approve every shell command. The runner requests non-interactive
 permission handling when the installed CLI supports it; a denied command shows up as
@@ -71,15 +73,15 @@ npm installs CLIs such as `codex`, `claude`, `kimi` and `gemini` as `.cmd` shims
 every argument of a batch file: it cuts an argument at its first newline and runs whatever follows
 an unbalanced quote. The runner reads npm's shim and launches its real target directly, either
 `node <script>` or the native executable, and `probe` shows that as `launch`. A batch file it cannot
-read is refused when an argument holds a newline, a quote, `&`, `|`, `<`, `>`, `^`, `%` or `!`; point
-the worker at the real executable instead.
+read runs through `cmd.exe` only when no argument holds a newline, a quote, `&`, `|`, `<`, `>`,
+`^`, `%` or `!`. Otherwise it is refused; point the worker at the real executable instead.
 
 ## Resuming
 
 Copy a successful worker's `sessionId` into a later worker's `resume` field. Keep the provider the
 same. Codex resumes with the sandbox of the new worker's mode and its effort; Claude, Agy and Kimi
 keep the settings of the original session. Claude streams its events, so a Claude worker that timed
-out or went quiet still leaves its session id for the rescue strategy.
+out or went quiet still leaves its session id for runner strategy `rescue`.
 
 Resume only a closely related follow-up. If no session ID was emitted, create a new worker with a
 compact handoff instead.
@@ -107,5 +109,6 @@ loss of isolation.
 ## Unsupported MCP features
 
 Plain CLI workers do not appear on Alethe's orchestration board. The runner cannot provide live
-mid-turn steering, approval dialogs, or quota readings that a provider does not expose. Use the
-`alethe_*` MCP tools when those capabilities matter.
+mid-turn steering or approval dialogs. Claude and Codex quota readings are available through
+`usage` without MCP; other readings still need Alethe or the user as [playbooks.md](playbooks.md)
+describes. Use the `alethe_*` MCP tools when board or steering capabilities matter.

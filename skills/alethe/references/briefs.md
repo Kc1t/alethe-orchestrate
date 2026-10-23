@@ -9,7 +9,7 @@ retries pay again. Score it before sending:
 
 | Part | Score |
 | --- | --- |
-| Goal | 0 missing, 1 vague, 2 clear, 3 clear and testable |
+| Task goal | 0 missing, 1 vague, 2 clear, 3 clear and testable |
 | Expected result | 0 missing, 1 vague, 2 clear, 3 checkable by a command or a diff |
 | Scope | 0 none, 1 a direction, 2 the paths it owns and the ones it must not touch |
 | Constraints | 0 none, 1 some, 2 the repository rules and limits that apply |
@@ -21,7 +21,7 @@ Below 7, read more or ask the user before sending anything.
 In this order:
 
 1. One line on where the unit fits in the whole task.
-2. The goal and the definition of done, written as checks that pass or fail.
+2. The task goal and the definition of done, written as checks that pass or fail.
 3. The paths it owns, and what it must leave untouched.
 4. Interfaces and decisions from earlier waves that it cannot discover by itself.
 5. How you resolved any ambiguity you noticed in the request.

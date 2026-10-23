@@ -1,6 +1,6 @@
 # Plan architecture diagram
 
-When the user asks to see the strategy, render the **resolved dry-run**, not an idealized preset.
+When the user asks to see the runner strategy, render the **resolved dry-run**, not an idealized preset.
 The diagram must identify the lead, each actual worker, its CLI, model or tier when known,
 read-only/write mode, worktree isolation, and the relationship between workers. Show a proxy such
 as 9router only when the user's selected route actually uses it. If a model or route is unknown,

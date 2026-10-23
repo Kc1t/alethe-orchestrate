@@ -1,14 +1,19 @@
 """Validate a playbooks file against the rules the planner and runner rely on. Needs PyYAML."""
 
 import datetime as dt
+import importlib.util
 import re
 import sys
 from pathlib import Path
 
 import yaml
 
-BUNDLED = Path(__file__).resolve().parent.parent / "skills" / "alethe-orchestrate" / "playbooks.yaml"
-RUNNER_CAPS = {"economy": 1, "balanced": 4, "quality": 1, "research": 8, "parallel": 8, "rescue": 1}
+BUNDLED = Path(__file__).resolve().parent.parent / "skills" / "alethe" / "playbooks.yaml"
+RUNNER = BUNDLED.parent / "scripts" / "orchestrate.py"
+runner_spec = importlib.util.spec_from_file_location("orchestrate", RUNNER)
+runner = importlib.util.module_from_spec(runner_spec)
+runner_spec.loader.exec_module(runner)
+RUNNER_CAPS = {name: rules["maxWorkers"] for name, rules in runner.STRATEGIES.items() if name != "auto"}
 TIERS = {"cheap", "standard", "strong"}
 EFFORTS = {"low", "medium", "high", "xhigh", "max"}
 BUILT_IN = {"claude", "codex", "agy", "kimi"}
@@ -18,7 +23,7 @@ PHASE_KEYS = {
     "id", "role", "who", "tier", "provider", "model", "effort", "readOnly", "workers", "isolate",
     "runner", "does", "returns", "limit", "gate", "if", "with", "after", "then", "rules",
 }
-QUOTA_KEYS = {"criticalThreshold", "whenLow", "onBothCritical", "whenSpare", "spareWithinHours", "spareMinLeft", "planEnds"}
+QUOTA_KEYS = {"criticalThreshold", "stopAt", "whenLow", "onBothCritical", "whenSpare", "spareWithinHours", "spareMinLeft", "planEnds"}
 ADAPTER_KEYS = {"command", "args", "promptTransport", "outputFormat", "modelFlag", "effortFlag", "checked"}
 ADAPTER_REQUIRED = {"command", "args", "promptTransport", "outputFormat", "checked"}
 
@@ -48,12 +53,14 @@ def check_quota(problems, quota, providers, where="quota", partial=False):
     for key, allowed in choices.items():
         if (key in quota or not partial) and quota.get(key) not in allowed:
             problems.append(f"{where}.{key} {quota.get(key)!r}")
-    for key, low, high in (("criticalThreshold", 1, 100), ("spareWithinHours", 1, 168), ("spareMinLeft", 1, 100)):
+    for key, low, high in (("criticalThreshold", 1, 100), ("stopAt", 1, 100), ("spareWithinHours", 1, 168), ("spareMinLeft", 1, 100)):
         if key not in quota and partial:
             continue
         value = quota.get(key)
         if not isinstance(value, int) or isinstance(value, bool) or not low <= value <= high:
             problems.append(f"{where}.{key} {value!r}")
+    if isinstance(quota.get("stopAt"), int) and isinstance(quota.get("criticalThreshold"), int) and quota["stopAt"] < quota["criticalThreshold"]:
+        problems.append(f"{where}.stopAt is below criticalThreshold")
     ends = quota.get("planEnds", {})
     if not isinstance(ends, dict):
         problems.append(f"{where}.planEnds must be a map")

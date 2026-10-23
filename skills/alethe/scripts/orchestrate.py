@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import copy
 import datetime as dt
+import functools
 import hashlib
 import json
 import math
@@ -168,6 +170,22 @@ MODEL_TIER_KEYS = ("cheap", "strong")
 COST_REPORTING_PROVIDERS = ("claude",)
 ARGUMENT_PROMPT_LIMIT = 30000 if os.name == "nt" else 100000
 WORKER_ENV_FLAG = "ALETHE_ORCHESTRATE_WORKER"
+GIT_TIMEOUT_SECONDS = 300
+ATOMIC_REPLACE_ATTEMPTS = 5
+ATOMIC_REPLACE_BACKOFF_SECONDS = 0.025
+DEFAULT_WAIT_SECONDS = 100
+MAX_WAIT_SECONDS = 540
+RUNNER_STDOUT_FILE = "runner.stdout.log"
+RUNNER_STDERR_FILE = "runner.stderr.log"
+UNSAFE_SEED_CHARACTERS = "*?[:"
+WINDOWS_CREATE_SUSPENDED = 0x00000004
+JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+PROCESS_TERMINATE = 0x0001
+WINDOWS_ACCESS_DENIED = 5
+PROCESS_STOP_TIMEOUT_SECONDS = 30
+STILL_ACTIVE = 259
 POLL_SECONDS = 1.0
 STATE_REFRESH_SECONDS = 5.0
 FINGERPRINT_MAX_BYTES = 20 * 1024 * 1024
@@ -183,7 +201,8 @@ HANDOFF_LINE = re.compile(
     r"^[\s>*_`#-]*(STATUS|SUMMARY|VERDICT)[*_`]*\s*:[*_`\s]*(.+?)[*_`\s]*$", re.MULTILINE | re.IGNORECASE
 )
 FAILURE_HINTS = {
-    "rate_limited": "the provider hit a usage limit; run the unit on the next provider in the order, or after the reset",
+    "rate_limited": "the provider hit a usage limit; ask the user whether to wait for the reset or move the unit to another provider",
+    "quota_low": "its provider reached quota.stopAt before it started; ask the user whether to wait, move it or confirm --allow-low-quota",
     "auth_required": "log in to the CLI or check its subscription, then run the unit again",
     "not_installed": "install the CLI or pick another provider",
     "stalled": "it went quiet for too long; resume its session or narrow the task",
@@ -229,9 +248,20 @@ def now_iso() -> str:
 
 def atomic_write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_name(path.name + ".tmp")
-    temp.write_text(text, encoding="utf-8")
-    os.replace(temp, path)
+    temp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temp.write_text(text, encoding="utf-8")
+        for attempt in range(ATOMIC_REPLACE_ATTEMPTS):
+            try:
+                os.replace(temp, path)
+                return
+            except PermissionError:
+                if attempt == ATOMIC_REPLACE_ATTEMPTS - 1:
+                    raise
+                time.sleep(ATOMIC_REPLACE_BACKOFF_SECONDS * (2 ** attempt))
+    finally:
+        if temp.exists():
+            temp.unlink()
 
 
 def atomic_write_json(path: Path, value: Any) -> None:
@@ -295,14 +325,601 @@ def effective_playbooks_path(policy_path: Path) -> Path:
     return user if user.is_file() else bundled_playbooks_path()
 
 
+PLAYBOOKS_VERSION = 1
+PLAYBOOK_TOP_FIELDS = {
+    "version", "goal", "setup", "principles", "providers", "models", "adapters", "routes",
+    "tiers", "quota", "budget", "profile", "profiles", "pickOrder", "playbooks", "routing", "sources",
+}
+PLAYBOOK_PHASE_FIELDS = {
+    "id", "role", "who", "tier", "provider", "model", "effort", "readOnly", "workers", "isolate",
+    "runner", "does", "returns", "limit", "gate", "if", "with", "after", "then", "rules",
+}
+PLAYBOOK_FIELDS = {"name", "goal", "pickWhen", "saves", "avoidWhen", "source", "next", "phases"}
+PLAYBOOK_PROFILE_FIELDS = {"name", "summary", "order", "quota", "tiers"}
+PLAYBOOK_PHASE_ENUMS = {
+    "who": ("lead", "worker"), "tier": MODEL_TIERS,
+    "runner": tuple(name for name in STRATEGIES if name != "auto"), "then": ("next", "recheck", "done"),
+}
+PLAYBOOK_QUOTA_FIELDS = {
+    "criticalThreshold", "stopAt", "whenLow", "onBothCritical", "whenSpare", "spareWithinHours", "spareMinLeft",
+    "planEnds",
+}
+PLAYBOOK_MAX_DEPTH = 100
+PLAYBOOK_CACHE_SIZE = 16
+
+
+class _PlaybookMap(dict):
+    def __init__(self, line: int) -> None:
+        super().__init__()
+        self.line = line
+        self.key_lines: Dict[str, int] = {}
+
+
+class _PlaybookYamlReader:
+    def __init__(self, text: str) -> None:
+        self.lines: List[Tuple[int, int, str]] = []
+        for number, raw in enumerate(text.splitlines(), 1):
+            indent = len(raw) - len(raw.lstrip(" \t"))
+            if "\t" in raw[:indent]:
+                self.fail(number, "tabs are not supported for indentation")
+            content = self.uncomment(raw[indent:]).rstrip()
+            if content:
+                self.lines.append((number, indent, content))
+        self.index = 0
+
+    def fail(self, line: int, message: str) -> None:
+        raise PlanError(f"line {line}: {message}")
+
+    def uncomment(self, text: str) -> str:
+        quote = None
+        index = 0
+        previous = ""
+        while index < len(text):
+            char = text[index]
+            if quote:
+                if char == "\\" and quote == '"':
+                    index += 2
+                    continue
+                if char == quote:
+                    if quote == "'" and text[index:index + 2] == "''":
+                        index += 2
+                        continue
+                    quote = None
+            elif char == "#" and (index == 0 or text[index - 1].isspace()):
+                return text[:index]
+            elif char in "\"'" and (not previous or previous in ":,[{-"):
+                quote = char
+            if not char.isspace():
+                previous = char
+            index += 1
+        return text
+
+    def entry(self, text: str, line: int) -> Tuple[str, str]:
+        quote = None
+        index = 0
+        while index < len(text):
+            char = text[index]
+            if quote:
+                if char == "\\" and quote == '"':
+                    index += 2
+                    continue
+                if char == quote:
+                    if quote == "'" and text[index:index + 2] == "''":
+                        index += 2
+                        continue
+                    quote = None
+            elif index == 0 and char in "\"'":
+                quote = char
+            elif char == ":" and (index + 1 == len(text) or text[index + 1].isspace()):
+                key = self.value(text[:index].strip(), line)
+                if not isinstance(key, str) or not key or key == "<<":
+                    self.fail(line, "mapping keys must be non-empty strings; merges are unsupported")
+                return key, text[index + 1:].strip()
+            index += 1
+        self.fail(line, "expected a block mapping entry")
+
+    def value(self, text: str, line: int, depth: int = 0) -> Any:
+        value, end = self.flow_value(text, 0, line, depth, False)
+        if text[end:].strip():
+            self.fail(line, "unexpected text after value")
+        return value
+
+    def flow_value(self, text: str, start: int, line: int, depth: int, flow: bool) -> Tuple[Any, int]:
+        if depth > PLAYBOOK_MAX_DEPTH:
+            self.fail(line, "YAML nesting is too deep")
+        index = start
+        while index < len(text) and text[index].isspace():
+            index += 1
+        if index == len(text):
+            self.fail(line, "missing scalar value")
+        char = text[index]
+        if char in "\"'":
+            return self.quoted(text, index, line)
+        if char in "[{":
+            mapping = char == "{"
+            closing = "}" if mapping else "]"
+            result: Any = _PlaybookMap(line) if mapping else []
+            index += 1
+            while index < len(text) and text[index].isspace():
+                index += 1
+            if index < len(text) and text[index] == closing:
+                return result, index + 1
+            while index < len(text):
+                if mapping:
+                    if text[index] in "\"'":
+                        key, index = self.quoted(text, index, line)
+                    else:
+                        end = index
+                        while end < len(text) and text[end] not in ":,{}[]":
+                            end += 1
+                        key = self.scalar(text[index:end].strip(), line)
+                        index = end
+                    while index < len(text) and text[index].isspace():
+                        index += 1
+                    if not isinstance(key, str) or not key or key == "<<":
+                        self.fail(line, "flow mapping keys must be non-empty strings")
+                    if index == len(text) or text[index] != ":":
+                        self.fail(line, "expected ':' in flow mapping")
+                    if key in result:
+                        self.fail(line, f"duplicate mapping key {key!r}")
+                    value, index = self.flow_value(text, index + 1, line, depth + 1, True)
+                    result[key] = value
+                    result.key_lines[key] = line
+                else:
+                    value, index = self.flow_value(text, index, line, depth + 1, True)
+                    result.append(value)
+                while index < len(text) and text[index].isspace():
+                    index += 1
+                if index < len(text) and text[index] == closing:
+                    return result, index + 1
+                if index == len(text) or text[index] != ",":
+                    self.fail(line, f"expected ',' or '{closing}'")
+                index += 1
+                while index < len(text) and text[index].isspace():
+                    index += 1
+                if index == len(text) or text[index] == closing:
+                    self.fail(line, "missing value after ','")
+            self.fail(line, f"unclosed flow collection, expected '{closing}'")
+        end = index
+        while end < len(text) and (not flow or text[end] not in ",]}{"):
+            end += 1
+        return self.scalar(text[index:end].strip(), line), end
+
+    def quoted(self, text: str, start: int, line: int) -> Tuple[str, int]:
+        quote = text[start]
+        result = []
+        index = start + 1
+        escapes = {
+            "0": "\0", "a": "\a", "b": "\b", "t": "\t", "n": "\n", "v": "\v", "f": "\f",
+            "r": "\r", "e": "\x1b", " ": " ", '"': '"', "/": "/", "\\": "\\",
+            "N": "\x85", "_": "\xa0", "L": "\u2028", "P": "\u2029",
+        }
+        while index < len(text):
+            char = text[index]
+            if char == quote:
+                if quote == "'" and text[index:index + 2] == "''":
+                    result.append("'")
+                    index += 2
+                    continue
+                return "".join(result), index + 1
+            if char == "\\" and quote == '"':
+                index += 1
+                if index == len(text):
+                    self.fail(line, "unfinished quoted escape")
+                escape = text[index]
+                if escape in ("x", "u", "U"):
+                    count = {"x": 2, "u": 4, "U": 8}[escape]
+                    digits = text[index + 1:index + 1 + count]
+                    if len(digits) != count or not re.fullmatch(r"[0-9a-fA-F]+", digits):
+                        self.fail(line, "invalid Unicode escape")
+                    codepoint = int(digits, 16)
+                    if codepoint > 0x10ffff or 0xd800 <= codepoint <= 0xdfff:
+                        self.fail(line, "invalid Unicode code point")
+                    result.append(chr(codepoint))
+                    index += count + 1
+                    continue
+                if escape not in escapes:
+                    self.fail(line, f"unsupported escape \\{escape}")
+                result.append(escapes[escape])
+                index += 1
+                continue
+            result.append(char)
+            index += 1
+        self.fail(line, "unterminated quoted string")
+
+    def scalar(self, text: str, line: int) -> Any:
+        if not text or text[0] in "&*!|>@%\x60,]}{[?:" or text in ("---", "...", "-"):
+            self.fail(line, "unsupported YAML syntax or missing scalar")
+        if re.search(r":(?:\s|$)", text):
+            self.fail(line, "unexpected mapping in scalar")
+        if text in ("true", "false"):
+            return text == "true"
+        if text.lower() in ("null", "~", "yes", "no", "on", "off", "true", "false", ".inf", "+.inf", "-.inf", ".nan"):
+            self.fail(line, "quote this scalar; only true/false booleans are supported")
+        if re.fullmatch(r"[-+]?(?:0|[1-9][0-9]*)", text):
+            return int(text)
+        if re.fullmatch(r"[-+]?(?:[0-9]+\.[0-9]*|\.[0-9]+|[0-9]+)(?:[eE][-+]?[0-9]+)?", text):
+            value = float(text)
+            if not math.isfinite(value):
+                self.fail(line, "non-finite numbers are unsupported")
+            return value
+        if re.match(r"[-+]?[0-9]", text) and re.fullmatch(r"[-+]?[0-9_:xXoObBa-fA-F.]+", text):
+            self.fail(line, "unsupported numeric syntax; use a decimal number or quote it")
+        return text
+
+    def block_entry(self, text: str, line: int, indent: int, depth: int) -> Tuple[str, Any]:
+        key, value = self.entry(text, line)
+        if value:
+            return key, self.value(value, line)
+        if self.index == len(self.lines):
+            self.fail(line, f"{key} needs a value; use {{}} or [] for an empty collection")
+        _, child_indent, child_text = self.lines[self.index]
+        indentless_list = child_indent == indent and child_text.startswith("- ")
+        if child_indent <= indent and not indentless_list:
+            self.fail(line, f"{key} needs a value; use {{}} or [] for an empty collection")
+        return key, self.block(child_indent, depth + 1)
+
+    def block(self, indent: int, depth: int = 0) -> Any:
+        if depth > PLAYBOOK_MAX_DEPTH:
+            self.fail(self.lines[self.index][0], "YAML nesting is too deep")
+        line, actual_indent, text = self.lines[self.index]
+        is_list = text == "-" or text.startswith("- ")
+        result: Any = [] if is_list else _PlaybookMap(line)
+        while self.index < len(self.lines):
+            line, actual_indent, text = self.lines[self.index]
+            if actual_indent < indent:
+                break
+            if actual_indent != indent:
+                self.fail(line, "inconsistent indentation")
+            item_is_list = text == "-" or text.startswith("- ")
+            if is_list and not item_is_list:
+                break
+            if not is_list and item_is_list:
+                self.fail(line, "cannot mix a block list and mapping")
+            self.index += 1
+            if not is_list:
+                key, value = self.block_entry(text, line, indent, depth)
+                if key in result:
+                    self.fail(line, f"duplicate mapping key {key!r}")
+                result[key] = value
+                result.key_lines[key] = line
+                continue
+            item = text[1:].strip()
+            if not item:
+                self.fail(line, "block list items need a scalar or mapping")
+            mapping_item = item[0] not in "[{" and bool(re.search(r":(?:\s|$)", item))
+            if item[0] in "\"'":
+                _, end = self.quoted(item, 0, line)
+                mapping_item = bool(re.match(r":(?:\s|$)", item[end:].lstrip()))
+            if not mapping_item:
+                result.append(self.value(item, line))
+                continue
+            mapping_indent = indent + text.index(item)
+            entry = _PlaybookMap(line)
+            key, value = self.block_entry(item, line, mapping_indent, depth + 1)
+            entry[key] = value
+            entry.key_lines[key] = line
+            if self.index < len(self.lines) and self.lines[self.index][1] > indent:
+                continuation = self.block(mapping_indent, depth + 1)
+                if not isinstance(continuation, dict):
+                    self.fail(self.lines[self.index - 1][0], "expected mapping fields after list item")
+                for key, value in continuation.items():
+                    if key in entry:
+                        self.fail(continuation.key_lines[key], f"duplicate mapping key {key!r}")
+                    entry[key] = value
+                    entry.key_lines[key] = continuation.key_lines[key]
+            result.append(entry)
+        return result
+
+
+def parse_playbooks_yaml(text: str) -> Any:
+    reader = _PlaybookYamlReader(text)
+    if not reader.lines:
+        raise PlanError("line 1: playbooks must not be empty")
+    if reader.lines[0][1] != 0:
+        reader.fail(reader.lines[0][0], "top-level indentation must be zero")
+    if len(reader.lines) == 1 and reader.lines[0][2][0] in "[{":
+        return reader.value(reader.lines[0][2], reader.lines[0][0])
+    value = reader.block(0)
+    if reader.index < len(reader.lines):
+        reader.fail(reader.lines[reader.index][0], "unexpected indentation")
+    return value
+
+
+def playbook_structure_errors(data: Any) -> List[str]:
+    errors: List[str] = []
+
+    def problem(owner: Any, key: str, label: str, message: str) -> None:
+        line = getattr(owner, "key_lines", {}).get(key, getattr(owner, "line", 1))
+        errors.append(f"line {line}: {label} {message}")
+
+    def mapping(value: Any, owner: Any, key: str, label: str, allowed: Any = None) -> bool:
+        if not isinstance(value, dict):
+            problem(owner, key, label, "must be a mapping")
+            return False
+        if allowed is not None:
+            for field in value:
+                if field not in allowed:
+                    problem(value, field, f"{label}.{field}", "is an unknown field")
+        return True
+
+    def strings(value: Any, owner: Any, key: str, label: str) -> bool:
+        if not isinstance(value, list) or any(not isinstance(item, str) or not item for item in value):
+            problem(owner, key, label, "must be a list of non-empty strings")
+            return False
+        return True
+
+    def named(value: Any, owner: Any, key: str, label: str) -> None:
+        if not isinstance(value, str) or not SAFE_NAME_PATTERN.fullmatch(value) or value.startswith("-"):
+            problem(owner, key, label, "must be a safe model or effort name")
+
+    def tiers(value: Any, owner: Any, key: str, label: str) -> None:
+        if not mapping(value, owner, key, label, MODEL_TIERS):
+            return
+        for tier, entries in value.items():
+            where = f"{label}.{tier}"
+            if not mapping(entries, value, tier, where):
+                continue
+            for provider, spec in entries.items():
+                entry_label = f"{where}.{provider}"
+                if provider not in providers:
+                    problem(entries, provider, entry_label, "is not in providers")
+                if mapping(spec, entries, provider, entry_label, ("model", "effort")):
+                    for field, entry in spec.items():
+                        named(entry, spec, field, f"{entry_label}.{field}")
+
+    def quota(value: Any, owner: Any, key: str, label: str) -> None:
+        if not mapping(value, owner, key, label, PLAYBOOK_QUOTA_FIELDS):
+            return
+        enums = {
+            "whenLow": ("switch-provider", "keep"), "onBothCritical": ("ask", "run-cheapest", "block"),
+            "whenSpare": ("spend-strong", "prefer", "ignore"),
+        }
+        for field, choices in enums.items():
+            if field in value and value[field] not in choices:
+                problem(value, field, f"{label}.{field}", f"must be one of {', '.join(choices)}")
+        for field, upper in (("criticalThreshold", 100), ("stopAt", 100), ("spareWithinHours", 168), ("spareMinLeft", 100)):
+            if field not in value:
+                continue
+            number = value[field]
+            if type(number) is not int or not 1 <= number <= upper:
+                problem(value, field, f"{label}.{field}", f"must be an integer between 1 and {upper}")
+        if "planEnds" in value:
+            mapping(value["planEnds"], value, "planEnds", f"{label}.planEnds")
+
+    if not mapping(data, data, "", "playbooks", PLAYBOOK_TOP_FIELDS):
+        return errors
+    if type(data.get("version")) is not int or data["version"] != PLAYBOOKS_VERSION:
+        problem(data, "version", "version", f"must be {PLAYBOOKS_VERSION}")
+    providers = data.get("providers")
+    if not strings(providers, data, "providers", "providers"):
+        providers = []
+    elif not providers or len(set(providers)) != len(providers):
+        problem(data, "providers", "providers", "must list each provider once and cannot be empty")
+    for provider in providers:
+        if not re.fullmatch(r"[a-z][a-z0-9-]{0,31}", provider):
+            problem(data, "providers", "providers", f"contains invalid provider id {provider!r}")
+    tiers(data.get("tiers"), data, "tiers", "tiers")
+    for field in ("principles", "sources"):
+        if field in data:
+            strings(data[field], data, field, field)
+    for field in ("setup", "models", "adapters", "routes", "routing"):
+        if field in data:
+            mapping(data[field], data, field, field)
+    if "quota" in data:
+        quota(data["quota"], data, "quota", "quota")
+    if "budget" in data and mapping(data["budget"], data, "budget", "budget", ("warnAt", "whenLow")):
+        budget = data["budget"]
+        if "warnAt" in budget and (type(budget["warnAt"]) is not int or not 1 <= budget["warnAt"] <= 100):
+            problem(budget, "warnAt", "budget.warnAt", "must be an integer between 1 and 100")
+        if "whenLow" in budget and budget["whenLow"] not in ("finish-and-report", "downgrade-tier", "stop"):
+            problem(budget, "whenLow", "budget.whenLow", "must be finish-and-report, downgrade-tier or stop")
+    profiles = data.get("profiles", {})
+    if mapping(profiles, data, "profiles", "profiles"):
+        active = data.get("profile")
+        if not isinstance(active, str) or active not in profiles:
+            problem(data, "profile", "profile", "must name an existing profile")
+        for profile, value in profiles.items():
+            label = f"profiles.{profile}"
+            if not mapping(value, profiles, profile, label, PLAYBOOK_PROFILE_FIELDS):
+                continue
+            if "tiers" in value:
+                tiers(value["tiers"], value, "tiers", f"{label}.tiers")
+            if "quota" in value:
+                quota(value["quota"], value, "quota", f"{label}.quota")
+            if "order" in value and strings(value["order"], value, "order", f"{label}.order"):
+                order = value["order"]
+                if len(set(order)) != len(order) or any(provider not in providers for provider in order):
+                    problem(value, "order", f"{label}.order", "must contain unique ids from providers")
+    books = data.get("playbooks")
+    if mapping(books, data, "playbooks", "playbooks"):
+        for book_id, book in books.items():
+            label = f"playbooks.{book_id}"
+            if not mapping(book, books, book_id, label, PLAYBOOK_FIELDS):
+                continue
+            for field in PLAYBOOK_FIELDS - {"phases"}:
+                if field in book and (not isinstance(book[field], str) or not book[field]):
+                    problem(book, field, f"{label}.{field}", "must be a non-empty string")
+            phases = book.get("phases")
+            if not isinstance(phases, list):
+                problem(book, "phases", f"{label}.phases", "must be a list")
+                continue
+            seen = set()
+            for phase in phases:
+                where = f"{label}.phases"
+                if not mapping(phase, book, "phases", where, PLAYBOOK_PHASE_FIELDS):
+                    continue
+                phase_id = phase.get("id")
+                if not isinstance(phase_id, str) or not ID_PATTERN.fullmatch(phase_id):
+                    problem(phase, "id", f"{where}.id", "must be a safe phase id")
+                elif phase_id in seen:
+                    problem(phase, "id", f"{where}.id", f"duplicates {phase_id}")
+                else:
+                    seen.add(phase_id)
+                for field, choices in PLAYBOOK_PHASE_ENUMS.items():
+                    if field in phase and phase[field] not in choices:
+                        problem(phase, field, f"{where}.{field}", f"must be one of {', '.join(choices)}")
+                for field in ("readOnly", "isolate"):
+                    if field in phase and not isinstance(phase[field], bool):
+                        problem(phase, field, f"{where}.{field}", "must be true or false")
+                if "workers" in phase and (type(phase["workers"]) is not int or not 1 <= phase["workers"] <= MAX_WORKERS):
+                    problem(phase, "workers", f"{where}.workers", f"must be an integer between 1 and {MAX_WORKERS}")
+                if "provider" in phase and phase["provider"] not in [*providers, "auto"]:
+                    problem(phase, "provider", f"{where}.provider", "must be auto or an id from providers")
+                for field in ("model", "effort"):
+                    if field in phase:
+                        named(phase[field], phase, field, f"{where}.{field}")
+                if "rules" not in phase:
+                    continue
+                if not isinstance(phase["rules"], list):
+                    problem(phase, "rules", f"{where}.rules", "must be a list")
+                    continue
+                for rule in phase["rules"]:
+                    if not mapping(rule, phase, "rules", f"{where}.rules", ("if", "use")):
+                        continue
+                    use = rule.get("use")
+                    if not mapping(use, rule, "use", f"{where}.rules.use", ("tier", "provider", "model", "effort")):
+                        continue
+                    if "tier" in use and use["tier"] not in MODEL_TIERS:
+                        problem(use, "tier", f"{where}.rules.use.tier", f"must be one of {', '.join(MODEL_TIERS)}")
+                    for field in ("model", "effort"):
+                        if field in use:
+                            named(use[field], use, field, f"{where}.rules.use.{field}")
+    picks = data.get("pickOrder", [])
+    if not isinstance(picks, list):
+        problem(data, "pickOrder", "pickOrder", "must be a list")
+        return errors
+    for pick in picks:
+        if not mapping(pick, data, "pickOrder", "pickOrder", ("when", "playbook")):
+            continue
+        target = pick.get("playbook")
+        if not isinstance(target, str) or not isinstance(books, dict) or target not in books:
+            problem(pick, "playbook", "pickOrder.playbook", "must name an existing playbook")
+        if not isinstance(pick.get("when"), str) or not pick["when"]:
+            problem(pick, "when", "pickOrder.when", "must be a non-empty string")
+    return errors
+
+
+@functools.lru_cache(maxsize=PLAYBOOK_CACHE_SIZE)
+def _cached_playbooks(path: str, modified: int, size: int) -> Tuple[str, Dict[str, Any]]:
+    text = read_playbooks(Path(path))
+    try:
+        data = parse_playbooks_yaml(text)
+        errors = playbook_structure_errors(data)
+    except PlanError as error:
+        raise PlanError(f"invalid playbooks at {path}: {error}") from error
+    if errors:
+        raise PlanError(f"invalid playbooks at {path}: " + "; ".join(errors))
+    return text, data
+
+
+def loaded_playbooks(policy_path: Path) -> Tuple[str, Dict[str, Any]]:
+    path = effective_playbooks_path(policy_path).resolve()
+    try:
+        status = path.stat()
+    except OSError as error:
+        raise PlanError(f"cannot read playbooks at {path}: {error}") from error
+    return _cached_playbooks(str(path), status.st_mtime_ns, status.st_size)
+
+
+def playbook_settings(policy_path: Optional[Path] = None) -> Dict[str, Any]:
+    _, parsed = loaded_playbooks(policy_path or default_policy_path())
+    data = copy.deepcopy(parsed)
+    profile = data["profiles"][data["profile"]]
+    data["tiers"] = {
+        tier: {
+            provider: {**data["tiers"].get(tier, {}).get(provider, {}), **profile.get("tiers", {}).get(tier, {}).get(provider, {})}
+            for provider in data["providers"]
+            if provider in data["tiers"].get(tier, {}) or provider in profile.get("tiers", {}).get(tier, {})
+        }
+        for tier in MODEL_TIERS
+    }
+    order = profile.get("order", data["providers"])
+    data["providers"] = [*order, *(provider for provider in data["providers"] if provider not in order)]
+    data["quota"] = {**data.get("quota", {}), **profile.get("quota", {})}
+    return data
+
+
 def read_playbooks(path: Path) -> str:
     try:
         text = path.read_text(encoding="utf-8")
     except OSError as error:
         raise PlanError(f"cannot read playbooks at {path}: {error}") from error
-    if not re.search(r"^version:\s*1\s*$", text, re.MULTILINE):
-        raise PlanError(f"{path} must declare 'version: 1'")
     return text
+
+
+def playbook_doctor(policy_path: Path) -> Dict[str, Any]:
+    path = effective_playbooks_path(policy_path)
+    try:
+        loaded_playbooks(policy_path)
+    except PlanError as error:
+        return {"path": str(path), "valid": False, "error": str(error)}
+    return {"path": str(path), "valid": True, "error": None}
+
+
+def selected_playbook_block(text: str, parsed: Dict[str, Any], book_id: str) -> str:
+    books = parsed["playbooks"]
+    lines = text.splitlines()
+    start = books.key_lines[book_id] - 1
+    first = lines[start]
+    if not first.strip().startswith(book_id + ":"):
+        return f"{json.dumps(book_id)}: {json.dumps(books[book_id], ensure_ascii=False)}"
+    indent = len(first) - len(first.lstrip())
+    end = start + 1
+    while end < len(lines):
+        line = lines[end]
+        if line.strip() and not line.lstrip().startswith("#") and len(line) - len(line.lstrip()) <= indent:
+            break
+        end += 1
+    return "\n".join(lines[start:end]).rstrip()
+
+
+def playbook_output(policy_path: Path, book_id: Optional[str], pick: bool, as_json: bool) -> str:
+    text, parsed = loaded_playbooks(policy_path)
+    settings = playbook_settings(policy_path)
+    if book_id and pick:
+        raise PlanError("pass a playbook id or --pick, not both")
+    if book_id and book_id not in parsed["playbooks"]:
+        raise PlanError(f"unknown playbook {book_id}; choose from {', '.join(parsed['playbooks'])}")
+    if pick:
+        payload = {
+            "profile": settings["profile"], "providers": settings["providers"],
+            "pickOrder": settings.get("pickOrder", []),
+            "playbooks": [
+                {"id": key, "name": book.get("name", key), "pickWhen": book.get("pickWhen", "")}
+                for key, book in settings["playbooks"].items()
+            ],
+        }
+        if as_json:
+            return json.dumps(payload, indent=2, ensure_ascii=False)
+        lines = [f"profile: {payload['profile']}", f"providers: {', '.join(payload['providers'])}"]
+        lines.extend(f"pick {index}: {item['when']} -> {item['playbook']}" for index, item in enumerate(payload["pickOrder"], 1))
+        lines.extend(f"{item['id']} | {item['name']} | {item['pickWhen']}" for item in payload["playbooks"])
+        return "\n".join(lines)
+    if not book_id:
+        if as_json:
+            return json.dumps(parsed, indent=2, ensure_ascii=False)
+        return f"# source: {effective_playbooks_path(policy_path)}\n{text.rstrip()}"
+    payload = {
+        "id": book_id, "playbook": parsed["playbooks"][book_id], "profile": settings["profile"],
+        "tiers": settings["tiers"], "providers": settings["providers"],
+        "quota": settings.get("quota", {}), "budget": settings.get("budget", {}),
+    }
+    if as_json:
+        return json.dumps(payload, indent=2, ensure_ascii=False)
+    lines = [selected_playbook_block(text, parsed, book_id), "", f"profile: {settings['profile']}", "resolved tiers:"]
+    for provider in settings["providers"]:
+        for tier in MODEL_TIERS:
+            spec = settings["tiers"].get(tier, {}).get(provider, {})
+            model = spec.get("model", "<CLI default>")
+            effort = spec.get("effort", "<CLI default>")
+            lines.append(f"  {provider} x {tier} -> model={model} effort={effort}")
+    lines.extend([
+        f"providers: {', '.join(settings['providers'])}",
+        f"quota: {json.dumps(payload['quota'], ensure_ascii=False)}",
+        f"budget: {json.dumps(payload['budget'], ensure_ascii=False)}",
+    ])
+    return "\n".join(lines)
 
 
 def init_playbooks(policy_path: Path, force: bool) -> Path:
@@ -315,6 +932,535 @@ def init_playbooks(policy_path: Path, force: bool) -> Path:
     temporary.write_text(text, encoding="utf-8")
     os.replace(temporary, target)
     return target
+
+
+USAGE_FILE = "alethe-usage.json"
+PRICES_FILE = "prices.json"
+USER_PRICES_FILE = "alethe-prices.json"
+USAGE_STALE_MINUTES = 30
+PRICE_STALE_DAYS = 60
+DEFAULT_CRITICAL_THRESHOLD = 80
+DEFAULT_STOP_THRESHOLD = 95
+QUOTA_SAMPLE_LIMIT = 40
+QUOTA_FORECAST_SAMPLES = 10
+QUOTA_FORECAST_MIN_SAMPLES = 2
+QUOTA_WINDOW_SLACK_SECONDS = 600
+CLAUDE_PROBE_MODEL = "haiku"
+CLAUDE_PROBE_SECONDS = 120
+CLAUDE_PROBE_PROMPT = "Reply with OK."
+CODEX_TAIL_BYTES = 256 * 1024
+TOKENS_PER_MILLION = 1000000
+MAIN_QUOTA_WINDOWS = ("5h", "week")
+QUOTA_PROVIDERS = ("claude", "codex")
+CLAUDE_QUOTA_WINDOWS = {"five_hour": "5h", "seven_day": "week", "seven_day_opus": "opus", "opus": "opus"}
+CODEX_QUOTA_WINDOWS = {300: "5h", 10080: "week"}
+TOKEN_PARTS = ("inputTokens", "cacheReadTokens", "cacheWriteTokens", "outputTokens")
+USAGE_LOCK = threading.Lock()
+
+
+def timestamp(value: Any) -> Optional[dt.datetime]:
+    try:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return dt.datetime.fromtimestamp(value, dt.timezone.utc)
+        if isinstance(value, str):
+            stamp = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return stamp.replace(tzinfo=dt.timezone.utc) if stamp.tzinfo is None else stamp
+    except (ValueError, OverflowError, OSError):
+        pass
+    return None
+
+
+def quota_thresholds(policy_path: Path) -> Tuple[float, float]:
+    try:
+        quota = playbook_settings(policy_path).get("quota", {})
+    except PlanError:
+        # doctor and validate report an invalid playbooks copy; usage still answers
+        return DEFAULT_CRITICAL_THRESHOLD, DEFAULT_STOP_THRESHOLD
+    critical = number(quota.get("criticalThreshold", DEFAULT_CRITICAL_THRESHOLD))
+    if critical is None or not 0 <= critical <= 100:
+        raise PlanError("quota.criticalThreshold must be between 0 and 100")
+    stop = number(quota.get("stopAt", max(DEFAULT_STOP_THRESHOLD, critical)))
+    if stop is None or not critical <= stop <= 100:
+        raise PlanError("quota.stopAt must be between quota.criticalThreshold and 100")
+    return critical, stop
+
+
+def local_clock(value: Any) -> str:
+    stamp = timestamp(value)
+    return stamp.astimezone().strftime("%H:%M") if stamp else "unknown"
+
+
+def quota_window(percent: Any, reset: Any) -> Optional[Dict[str, Any]]:
+    value, stamp = number(percent), timestamp(reset)
+    if value is None or not math.isfinite(value) or not 0 <= value <= 100 or stamp is None:
+        return None
+    return {"usedPercent": round(value, 4), "resetsAt": stamp.isoformat()}
+
+
+def claude_quota(values: Sequence[Any], observed_at: str) -> Optional[Dict[str, Any]]:
+    event = next((value for value in reversed(values) if isinstance(value, dict)
+                  and value.get("type") == "rate_limit_event"), None)
+    if event is None:
+        return None
+    info = event.get("rate_limit_info")
+    if not isinstance(info, dict):
+        return None
+    unified = info.get("unifiedWindows")
+    unified = unified if isinstance(unified, dict) else {}
+    windows = {}
+    for key, name in CLAUDE_QUOTA_WINDOWS.items():
+        raw = unified.get(key)
+        if not isinstance(raw, dict):
+            continue
+        utilization = number(raw.get("utilization"))
+        window = quota_window(utilization * 100 if utilization is not None else None, raw.get("resetsAt"))
+        if window:
+            windows[name] = window
+    if not windows:
+        return None
+    return {"provider": "claude", "windows": windows, "observedAt": observed_at, "source": "stream-json"}
+
+
+def codex_home() -> Path:
+    return Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
+
+
+def codex_quota(thread_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    try:
+        paths = list((codex_home() / "sessions").glob("*/*/*/rollout-*.jsonl"))
+        if not paths:
+            return None
+        preferred = [path for path in paths if thread_id and thread_id in path.name]
+        path = max(preferred or paths, key=lambda item: item.stat().st_mtime)
+        stat = path.stat()
+        with path.open("rb") as handle:
+            offset = max(0, stat.st_size - CODEX_TAIL_BYTES)
+            handle.seek(offset)
+            if offset:
+                handle.readline()
+            tail = handle.read(CODEX_TAIL_BYTES).decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    for line in reversed(tail.splitlines()):
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        payload = event.get("payload")
+        payload = payload if isinstance(payload, dict) else event
+        limits = payload.get("rate_limits")
+        if not isinstance(limits, dict) or limits.get("limit_id", "codex") != "codex":
+            continue
+        windows = {}
+        for key in ("primary", "secondary"):
+            raw = limits.get(key)
+            if not isinstance(raw, dict):
+                continue
+            name = CODEX_QUOTA_WINDOWS.get(raw.get("window_minutes"))
+            window = quota_window(raw.get("used_percent"), raw.get("resets_at"))
+            if name and window:
+                windows[name] = window
+        if not windows:
+            continue
+        observed = timestamp(event.get("timestamp")) or timestamp(stat.st_mtime)
+        return {"provider": "codex", "windows": windows, "observedAt": observed.isoformat(), "source": str(path)}
+    return None
+
+
+def usage_file(policy_path: Path) -> Dict[str, Any]:
+    path = policy_path.with_name(USAGE_FILE)
+    if not path.exists():
+        return {"providers": {}, "samples": []}
+    raw = read_json(path)
+    if not isinstance(raw, dict) or not isinstance(raw.get("providers"), dict):
+        raise PlanError(f"{path} must contain a providers object")
+    for provider, reading in raw["providers"].items():
+        if not isinstance(reading, dict) or not isinstance(reading.get("windows"), dict) or timestamp(reading.get("observedAt")) is None:
+            raise PlanError(f"invalid cached quota reading for {provider} in {path}")
+        for name, window in reading["windows"].items():
+            if not isinstance(window, dict) or quota_window(window.get("usedPercent"), window.get("resetsAt")) is None:
+                raise PlanError(f"invalid cached quota window for {provider}/{name} in {path}")
+    samples = raw.get("samples", [])
+    if not isinstance(samples, list) or not all(
+        isinstance(sample, dict) and sample.get("provider") in QUOTA_PROVIDERS and isinstance(sample.get("perWorker"), dict)
+        and all(number(value) is not None and value >= 0 for value in sample["perWorker"].values())
+        for sample in samples
+    ):
+        raise PlanError(f"invalid quota samples in {path}")
+    return {"providers": raw["providers"], "samples": samples}
+
+
+def saved_usage(policy_path: Path) -> Dict[str, Any]:
+    return usage_file(policy_path)["providers"]
+
+
+def write_usage_file(policy_path: Path, data: Dict[str, Any]) -> None:
+    path = policy_path.with_name(USAGE_FILE)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(json.dumps({"version": 1, **data}, indent=2) + "\n", encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def save_usage(policy_path: Path, quota: Optional[Dict[str, Any]]) -> None:
+    with USAGE_LOCK:
+        data = usage_file(policy_path)
+        providers = dict(data["providers"])
+        if quota:
+            provider = quota["provider"]
+            previous = providers.get(provider, {})
+            old = timestamp(previous.get("observedAt"))
+            observed = timestamp(quota.get("observedAt"))
+            if observed is None:
+                raise PlanError("quota.observedAt must be an ISO timestamp")
+            if old is None or observed >= old:
+                providers[provider] = quota
+        write_usage_file(policy_path, {**data, "providers": providers})
+
+
+def save_quota_samples(policy_path: Path, samples: Sequence[Dict[str, Any]]) -> None:
+    if not samples:
+        return
+    with USAGE_LOCK:
+        data = usage_file(policy_path)
+        write_usage_file(policy_path, {**data, "samples": [*data["samples"], *samples][-QUOTA_SAMPLE_LIMIT:]})
+
+
+def usage_payload(policy_path: Path, refresh: bool = True, now: Optional[dt.datetime] = None) -> Dict[str, Any]:
+    current = now or dt.datetime.now(dt.timezone.utc)
+    if refresh:
+        save_usage(policy_path, codex_quota())
+    threshold, stop = quota_thresholds(policy_path)
+    readings = saved_usage(policy_path)
+    providers = {}
+    for provider in BUILTIN_PROVIDERS:
+        reading = readings.get(provider, {})
+        observed = timestamp(reading.get("observedAt"))
+        age = max(0.0, (current - observed).total_seconds() / 60) if observed else None
+        windows = {}
+        for name, raw in reading.get("windows", {}).items():
+            window = quota_window(raw.get("usedPercent"), raw.get("resetsAt"))
+            if window is None:
+                raise PlanError(f"invalid cached quota window for {provider}/{name}")
+            reset = timestamp(window["resetsAt"]) <= current
+            windows[name] = {**window, "usedPercent": 0 if reset else window["usedPercent"],
+                             "observedAt": reading.get("observedAt"), "ageMinutes": round(age, 2) if age is not None else None,
+                             "stale": age is None or age > USAGE_STALE_MINUTES, "reset": reset,
+                             "low": not reset and window["usedPercent"] >= threshold,
+                             "blocked": not reset and window["usedPercent"] >= stop}
+        main = [windows[name] for name in MAIN_QUOTA_WINDOWS if name in windows]
+        providers[provider] = {"windows": windows, "observedAt": reading.get("observedAt"),
+            "ageMinutes": round(age, 2) if age is not None else None,
+            "low": any(window["low"] for window in main), "blocked": any(window["blocked"] for window in main),
+            "stale": age is None or age > USAGE_STALE_MINUTES, "source": reading.get("source"),
+            "missing": not windows, "reset": any(window["reset"] for window in windows.values())}
+    return {"version": 1, "criticalThreshold": threshold, "stopAt": stop,
+            "cachePath": str(policy_path.with_name(USAGE_FILE)), "providers": providers}
+
+
+def worker_windows(worker: Dict[str, Any]) -> Tuple[str, ...]:
+    if worker["provider"] == "claude" and "opus" in str(worker.get("model") or "").lower():
+        return (*MAIN_QUOTA_WINDOWS, "opus")
+    return MAIN_QUOTA_WINDOWS
+
+
+def quota_refusal(workers: Sequence[Dict[str, Any]], policy_path: Path) -> Optional[str]:
+    usage = usage_payload(policy_path)
+    for worker in workers:
+        provider = worker["provider"]
+        if provider not in QUOTA_PROVIDERS:
+            continue
+        reading = usage["providers"][provider]["windows"]
+        blocked = [(name, reading[name]) for name in worker_windows(worker) if name in reading and reading[name]["blocked"]]
+        if blocked:
+            name, window = max(blocked, key=lambda item: item[1]["usedPercent"])
+            return (f"{provider} is at {window['usedPercent']:g}% of its {name} window, at or past the "
+                    f"{usage['stopAt']:g}% stop line (resets {local_clock(window['resetsAt'])}); ask the user to wait "
+                    "for the reset, move the work to another provider, or confirm --allow-low-quota")
+    return None
+
+
+def probe_claude_quota(policy_path: Path) -> Optional[Dict[str, Any]]:
+    worker = {"provider": "claude", "mode": "read-only", "model": CLAUDE_PROBE_MODEL, "effort": "low",
+              "resume": None, "mcp": False}
+    with tempfile.TemporaryDirectory(prefix="alethe-usage-") as folder:
+        cwd = Path(folder)
+        args, _, _, _ = build_invocation(worker, cwd, cwd, {}, threading.Lock(), CLAUDE_PROBE_SECONDS)
+        try:
+            completed = subprocess.run(args, input=CLAUDE_PROBE_PROMPT.encode("utf-8"), cwd=cwd,
+                env=worker_environment(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                timeout=CLAUDE_PROBE_SECONDS)
+        except subprocess.TimeoutExpired as error:
+            raise PlanError(f"Claude did not answer within {CLAUDE_PROBE_SECONDS} seconds") from error
+        except OSError as error:
+            raise PlanError(f"could not start Claude: {error}") from error
+    quota = claude_quota(json_values(completed.stdout.decode("utf-8", errors="replace"), "jsonl"), now_iso())
+    save_usage(policy_path, quota)
+    return quota
+
+
+def quota_samples(
+    workers: Sequence[Dict[str, Any]], outcomes: Sequence[Dict[str, Any]],
+    before: Dict[str, Any], after: Dict[str, Any], started: dt.datetime,
+) -> List[Dict[str, Any]]:
+    ran = {outcome["id"] for outcome in outcomes if outcome["status"] != "skipped"}
+    samples = []
+    for provider in QUOTA_PROVIDERS:
+        mine = [worker for worker in workers if worker["provider"] == provider and worker["id"] in ran]
+        start, end = before.get(provider), after.get(provider)
+        if not mine or not start or not end:
+            continue
+        opened, closed = timestamp(start["observedAt"]), timestamp(end["observedAt"])
+        # Claude readings come only from workers, so an old one would hide the lead's own use
+        if closed <= opened or (provider == "claude" and (started - opened).total_seconds() > USAGE_STALE_MINUTES * 60):
+            continue
+        windows = {}
+        for name in MAIN_QUOTA_WINDOWS:
+            first, last = start["windows"].get(name), end["windows"].get(name)
+            if first and last and abs((timestamp(first["resetsAt"]) - timestamp(last["resetsAt"])).total_seconds()) <= QUOTA_WINDOW_SLACK_SECONDS:
+                windows[name] = round(max(0.0, last["usedPercent"] - first["usedPercent"]) / len(mine), 4)
+        if windows:
+            models = {worker["model"] for worker in mine}
+            samples.append({"provider": provider, "model": models.pop() if len(models) == 1 else None,
+                            "workers": len(mine), "observedAt": end["observedAt"], "perWorker": windows})
+    return samples
+
+
+def quota_forecast(workers: Sequence[Dict[str, Any]], policy_path: Path, usage: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
+    samples = usage_file(policy_path)["samples"]
+    forecast, warnings = {}, []
+    for provider in QUOTA_PROVIDERS:
+        mine = [worker for worker in workers if worker["provider"] == provider]
+        if not mine:
+            continue
+        reading = usage["providers"][provider]
+        history = [sample for sample in samples if sample["provider"] == provider]
+        entry: Dict[str, Any] = {"workers": len(mine), "samples": len(history), "windows": {}}
+        for name in MAIN_QUOTA_WINDOWS:
+            if name not in reading["windows"]:
+                continue
+            window = reading["windows"][name]
+            shares: Optional[List[float]] = []
+            for worker in mine:
+                same = [sample["perWorker"][name] for sample in history if sample["model"] == worker["model"] and name in sample["perWorker"]]
+                pool = same if len(same) >= QUOTA_FORECAST_MIN_SAMPLES else [
+                    sample["perWorker"][name] for sample in history if name in sample["perWorker"]]
+                if len(pool) < QUOTA_FORECAST_MIN_SAMPLES:
+                    shares = None
+                    break
+                recent = sorted(pool[-QUOTA_FORECAST_SAMPLES:])
+                shares.append(recent[len(recent) // 2])
+            projected = round(sum(shares), 1) if shares is not None else None
+            after = round(window["usedPercent"] + projected, 1) if projected is not None else None
+            entry["windows"][name] = {"usedPercent": window["usedPercent"], "projectedPercent": projected,
+                                      "afterPercent": after, "resetsAt": window["resetsAt"], "stale": window["stale"]}
+            if after is not None and after >= usage["stopAt"] and not window["blocked"]:
+                warnings.append(f"{provider} may use about {projected:g}% of its {name} window in this wave, from "
+                                f"{len(history)} past waves: {window['usedPercent']:g}% now would reach {after:g}%, past the "
+                                f"{usage['stopAt']:g}% stop line before the {local_clock(window['resetsAt'])} reset; ask the user first")
+        forecast[provider] = entry
+    return forecast, warnings
+
+
+def usage_summary(payload: Dict[str, Any]) -> List[str]:
+    lines = []
+    for provider, reading in payload["providers"].items():
+        if provider not in QUOTA_PROVIDERS and reading["missing"]:
+            continue
+        parts = []
+        for name, window in reading["windows"].items():
+            reset = timestamp(window["resetsAt"]).astimezone().strftime("%H:%M")
+            parts.append(f"{name} {window['usedPercent']:g}% (reset passed)" if window["reset"]
+                         else f"{name} {window['usedPercent']:g}% (resets {reset})")
+        detail = "; ".join(parts) if parts else "no reading"
+        flags = [name for name in ("low", "blocked", "stale") if reading[name]]
+        lines.append(f"Usage {provider}: {detail}" + (f" [{', '.join(flags)}]" if flags else ""))
+    return lines
+
+
+def worker_quota(provider: str, values: Sequence[Any], policy_path: Path) -> Optional[Dict[str, Any]]:
+    quota = claude_quota(values, now_iso()) if provider == "claude" else None
+    if provider == "codex":
+        quota = codex_quota(extract_session(values))
+    save_usage(policy_path, quota)
+    return quota
+
+
+PRICE_RANKS = ("low", "mid", "high")
+CLI_COST_LOW = 1
+CLI_COST_HIGH = 3
+
+
+def load_prices(policy_path: Path) -> Dict[str, Any]:
+    bundled = Path(__file__).resolve().parent.parent / PRICES_FILE
+    raw = read_json(bundled)
+    if not isinstance(raw, dict) or raw.get("version") != 1 or raw.get("currency") != "USD" or raw.get("unit") != "per 1M tokens":
+        raise PlanError(f"invalid price table: {bundled}")
+    models = raw.get("models")
+    if not isinstance(models, dict):
+        raise PlanError(f"{bundled} must contain a models object")
+    models = dict(models)
+    billing = {}
+    override = policy_path.with_name(USER_PRICES_FILE)
+    if override.exists():
+        user = read_json(override)
+        if not isinstance(user, dict) or not isinstance(user.get("models", {}), dict) or not isinstance(user.get("billing", {}), dict):
+            raise PlanError(f"{override} must contain models and billing objects")
+        for key, entry in user.get("models", {}).items():
+            if not isinstance(entry, dict):
+                raise PlanError(f"price for {key} must be an object")
+            models[key] = {**models.get(key, {}), **entry}
+        billing = user.get("billing", {})
+    for provider, mode in billing.items():
+        if mode not in ("subscription", "api"):
+            raise PlanError(f"billing for {provider} must be subscription or api")
+    for key, entry in models.items():
+        if "/" not in key or not isinstance(entry, dict):
+            raise PlanError(f"invalid model price: {key}")
+        for name in ("input", "output", "cacheRead", "cacheWrite"):
+            value = number(entry.get(name))
+            if name not in entry and name not in ("input", "output"):
+                continue
+            if value is None or not math.isfinite(value) or value < 0:
+                raise PlanError(f"price {key}.{name} must be a nonnegative number")
+        try:
+            dt.date.fromisoformat(entry["asOf"])
+        except (KeyError, TypeError, ValueError):
+            raise PlanError(f"price {key}.asOf must be YYYY-MM-DD")
+        if not isinstance(entry.get("source"), str) or not entry["source"].startswith("https://"):
+            raise PlanError(f"price {key}.source must be an HTTPS URL")
+    return {**raw, "models": models, "billing": billing, "overridePath": str(override)}
+
+
+def playbook_model_inventory(policy_path: Path) -> Dict[str, Dict[str, Optional[float]]]:
+    text = read_playbooks(effective_playbooks_path(policy_path))
+    inventory: Dict[str, Dict[str, Optional[float]]] = {}
+    section = provider = model = None
+    provider_indent = -1
+    for line in text.splitlines():
+        clean = line.split("#", 1)[0].rstrip()
+        if not clean.strip():
+            continue
+        indent = len(clean) - len(clean.lstrip())
+        if indent == 0:
+            section = clean.split(":", 1)[0]
+            provider = model = None
+            continue
+        if section not in ("models", "tiers"):
+            continue
+        content = clean.strip()
+        head = re.match(r"([\w.-]+):\s*(.*)", content)
+        if head and (head.group(1) in BUILTIN_PROVIDERS or head.group(1) in PROVIDER_ALIASES or (section == "models" and indent == 2)):
+            provider = PROVIDER_ALIASES.get(head.group(1), head.group(1))
+            provider_indent = indent
+            model = None
+            inventory.setdefault(provider, {})
+            rest = head.group(2)
+            if section == "models" and rest.startswith("["):
+                for item in re.findall(r"\{[^}]*\}|[^,\[\]]+", rest[1:-1]):
+                    match = re.search(r"\bid:\s*['\"]?([\w./:-]+)", item)
+                    name = match.group(1) if match else item.strip().strip("'\"")
+                    cost = re.search(r"\b(?:cost|costMultiplier):\s*([\d.]+)", item)
+                    if name:
+                        inventory[provider][name] = float(cost.group(1)) if cost else None
+        if provider is None:
+            continue
+        match = re.search(r"\b(?:model|id):\s*['\"]?([\w./:-]+)", content)
+        if match:
+            model = match.group(1)
+            inventory[provider].setdefault(model, None)
+        if section == "models" and indent > provider_indent and not match:
+            item = re.match(r"-\s+['\"]?([\w./:-]+)['\"]?\s*$", content)
+            mapped = re.match(r"['\"]?([\w./-]+)['\"]?:\s*\{", content)
+            if item or mapped:
+                model = (item or mapped).group(1)
+                inventory[provider].setdefault(model, None)
+        cost = re.search(r"\b(?:cost|costMultiplier):\s*([\d.]+)", content)
+        if model and cost:
+            inventory[provider][model] = float(cost.group(1))
+    return inventory
+
+
+def models_payload(policy_path: Path, now: Optional[dt.datetime] = None) -> Dict[str, Any]:
+    current = now or dt.datetime.now(dt.timezone.utc)
+    table = load_prices(policy_path)
+    inventory = playbook_model_inventory(policy_path)
+    cache = read_optional_json(codex_home() / "models_cache.json")
+    cached = cache.get("models", []) if isinstance(cache, dict) else []
+    for entry in cached if isinstance(cached, list) else []:
+        name = entry.get("slug") or entry.get("id") if isinstance(entry, dict) else None
+        if isinstance(name, str):
+            inventory.setdefault("codex", {}).setdefault(name, None)
+    for key in table["models"]:
+        provider, model = key.split("/", 1)
+        inventory.setdefault(provider, {}).setdefault(model, None)
+    providers = {}
+    for provider in dict.fromkeys((*BUILTIN_PROVIDERS, *inventory)):
+        known = inventory.get(provider, {})
+        scores = sorted({entry["input"] + entry["output"] for key, entry in table["models"].items()
+                         if key.split("/", 1)[0] == provider})
+        models = []
+        for model, multiplier in sorted(known.items()):
+            price = table["models"].get(f"{provider}/{model}")
+            rank = None
+            if price:
+                score = price["input"] + price["output"]
+                index = scores.index(score)
+                rank = PRICE_RANKS[min(len(PRICE_RANKS)-1, index * len(PRICE_RANKS) // len(scores))]
+            if multiplier is not None:
+                rank = "low" if multiplier <= CLI_COST_LOW else "high" if multiplier >= CLI_COST_HIGH else "mid"
+            models.append({"model": model, "input": price["input"] if price else None,
+                "output": price["output"] if price else None, "cacheRead": price.get("cacheRead") if price else None,
+                "cacheWrite": price.get("cacheWrite") if price else None, "rank": rank,
+                "costMultiplier": multiplier, "asOf": price["asOf"] if price else None,
+                "stale": (current.date() - dt.date.fromisoformat(price["asOf"])).days > PRICE_STALE_DAYS if price else False,
+                "missing": price is None, "source": price["source"] if price else None})
+        providers[provider] = {"billing": table["billing"].get(provider), "models": models}
+    return {"version": 1, "currency": table["currency"], "unit": table["unit"],
+            "overridePath": table["overridePath"], "providers": providers}
+
+
+def preview_usage_cost(workers: Sequence[Dict[str, Any]], policy_path: Path) -> Dict[str, Any]:
+    table = load_prices(policy_path)
+    usage = usage_payload(policy_path, refresh=False)
+    warnings = []
+    estimates = []
+    for worker in workers:
+        provider = worker["provider"]
+        price = table["models"].get(f"{provider}/{worker['model']}")
+        estimates.append({"listPriceEstimateUsd": round(worker["estimatedPromptTokens"] * price["input"] / TOKENS_PER_MILLION, 8) if price else None,
+                          "listPriceAsOf": price["asOf"] if price else None})
+        reading = usage["providers"].get(provider, {})
+        if not reading.get("low"):
+            continue
+        name = max((name for name in MAIN_QUOTA_WINDOWS if name in reading["windows"]),
+                   key=lambda name: reading["windows"][name]["usedPercent"])
+        window = reading["windows"][name]
+        reset = timestamp(window["resetsAt"]).astimezone().strftime("%H:%M")
+        warning = f"{worker['id']}: {provider} is at {window['usedPercent']:g}% of its {name} window (resets {reset})"
+        alternatives = [(other, max((entry["windows"][key]["usedPercent"] for key in MAIN_QUOTA_WINDOWS if key in entry["windows"]), default=0))
+                        for other, entry in usage["providers"].items() if other != provider and not entry["missing"]
+                        and not entry["low"] and not entry["stale"]]
+        if window["blocked"]:
+            warning += f", past the {usage['stopAt']:g}% stop line, so run refuses it; ask the user"
+        if alternatives:
+            other, percent = min(alternatives, key=lambda item: item[1])
+            warning += f"; consider {other} at {percent:g}%"
+        if reading["stale"]:
+            warning += "; reading is stale"
+        warnings.append(warning)
+    forecast, forecast_warnings = quota_forecast(workers, policy_path, usage)
+    values = [entry["listPriceEstimateUsd"] for entry in estimates]
+    return {"workers": estimates, "warnings": warnings + forecast_warnings, "quotaForecast": forecast,
+        "total": round(sum(values), 8) if values and all(value is not None for value in values) else None,
+        "asOf": sorted({entry["listPriceAsOf"] for entry in estimates if entry["listPriceAsOf"]}),
+        "label": "Standard short-context API list-price estimate for prompt input only; excludes output, cache and provider-side context; not CLI-reported cost"}
 
 
 def normalized_strategy(value: Any, label: str) -> str:
@@ -387,26 +1533,44 @@ def estimated_prompt_tokens(text: str) -> int:
     return max(1, -(-len(text) // 4))
 
 
+RAW_TOKEN_PARTS = ("input_tokens", "output_tokens", "cached_input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
+
+
+def normalized_usage(usage: Dict[str, Any]) -> Dict[str, Any]:
+    if not any(key in usage for key in TOKEN_PARTS + RAW_TOKEN_PARTS):
+        return dict(usage)
+    for key in TOKEN_PARTS + RAW_TOKEN_PARTS:
+        if key not in usage:
+            continue
+        value = number(usage[key])
+        if value is None or not math.isfinite(value) or value < 0 or int(value) != value:
+            raise PlanError(f"usage.{key} must be a nonnegative integer")
+    if any(key in usage for key in TOKEN_PARTS):
+        return {key: int(usage.get(key, 0)) for key in TOKEN_PARTS}
+    cached = int(usage.get("cached_input_tokens", 0))
+    uncached = int(usage.get("input_tokens", 0)) - cached
+    if uncached < 0:
+        raise PlanError("usage.cached_input_tokens exceeds input_tokens")
+    return {
+        "inputTokens": uncached,
+        "cacheReadTokens": int(usage.get("cache_read_input_tokens", cached)),
+        "cacheWriteTokens": int(usage.get("cache_creation_input_tokens", 0)),
+        "outputTokens": int(usage.get("output_tokens", 0)),
+    }
+
+
 def reported_total_tokens(usage: Any) -> Optional[int]:
-    if not isinstance(usage, dict):
+    if not isinstance(usage, dict) or not usage:
         return None
+    if any(key in usage for key in TOKEN_PARTS + ("input_tokens", "output_tokens", "cached_input_tokens",
+                                               "cache_creation_input_tokens", "cache_read_input_tokens")):
+        parts = normalized_usage(usage)
+        return parts["inputTokens"] + parts["cacheWriteTokens"] + parts["outputTokens"]
     for key in ("total_tokens", "totalTokens"):
-        value = usage.get(key)
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
+        value = number(usage.get(key))
+        if value is not None:
             return int(value)
-    # No explicit total: sum the parts. Codex's input_tokens already includes its
-    # cached_input_tokens, so the cached field is deliberately not added.
-    parts = [
-        usage.get(key)
-        for key in (
-            "input_tokens",
-            "output_tokens",
-            "cache_creation_input_tokens",
-            "cache_read_input_tokens",
-        )
-    ]
-    numeric = [int(value) for value in parts if isinstance(value, (int, float)) and not isinstance(value, bool)]
-    return sum(numeric) if numeric else None
+    return None
 
 
 def validate_model_tiers(raw: Any, label: str) -> Dict[str, Any]:
@@ -445,21 +1609,19 @@ def validate_model_tiers(raw: Any, label: str) -> Dict[str, Any]:
     return tiers
 
 
-def resolve_model_tier(worker: Dict[str, Any], policy: Dict[str, Any]) -> None:
+def resolve_model_tier(
+    worker: Dict[str, Any], policy: Dict[str, Any], settings: Dict[str, Any]
+) -> Dict[str, Any]:
     tier = worker["tier"]
-    if tier == "standard":
-        worker["modelNote"] = None
-        return
-    spec = policy["modelTiers"].get(tier, {}).get(worker["provider"], {})
-    if spec:
-        worker["model"] = spec.get("model")
-        worker["effort"] = spec.get("effort")
-        parts = ", ".join(f"{key} {value}" for key, value in spec.items())
-        worker["modelNote"] = f"tier {tier} on {worker['provider']}: {parts}"
-    else:
-        worker["model"] = None
-        worker["effort"] = None
-        worker["modelNote"] = f"tier {tier}: no model configured for {worker['provider']}"
+    provider = worker["provider"]
+    spec = {
+        **settings["tiers"].get(tier, {}).get(provider, {}),
+        **policy["modelTiers"].get(tier, {}).get(provider, {}),
+        **{key: worker[key] for key in ("model", "effort") if worker[key]},
+    }
+    parts = ", ".join(f"{key} {value}" for key, value in spec.items())
+    note = f"tier {tier} on {provider}: {parts}" if parts else f"tier {tier}: no model configured for {provider}"
+    return {**worker, "model": spec.get("model"), "effort": spec.get("effort"), "modelNote": note}
 
 
 def validate_policy(raw: Any) -> Dict[str, Any]:
@@ -644,7 +1806,7 @@ def normalized_provider(value: Any) -> str:
 def validate_relative_path(value: Any, label: str) -> str:
     text = require_string(value, label).replace("\\", "/")
     path = Path(text)
-    if path.is_absolute() or any(part in ("", ".", "..") for part in path.parts):
+    if any(character in text for character in UNSAFE_SEED_CHARACTERS) or path.is_absolute() or any(part in ("", ".", "..") for part in path.parts):
         raise PlanError(f"{label} must be a safe relative path")
     return text
 
@@ -674,7 +1836,9 @@ def validate_plan(
     plan_path: Path,
     policy: Optional[Dict[str, Any]] = None,
     strategy_override: Optional[str] = None,
+    policy_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
+    settings = playbook_settings(policy_path)
     policy = validate_policy(policy or DEFAULT_POLICY)
     if not isinstance(raw, dict):
         raise PlanError("plan must be a JSON object")
@@ -836,7 +2000,6 @@ def validate_plan(
             normalized["routingNote"] = (
                 f"conserved provider {requested_provider} replaced by providerSwitch=automatic"
             )
-        resolve_model_tier(normalized, policy)
         prompt_in_argument = chosen_provider in ("agy", "kimi") or (
             chosen_provider == "custom" and normalized["promptTransport"] == "argument"
         )
@@ -861,12 +2024,10 @@ def validate_plan(
         requested_strategy, normalized_workers, requested_concurrency, policy
     )
     if strategy == "economy":
-        # Economy means the cheapest run: default its single worker to the cheap tier unless
-        # the plan already pinned a tier or a model.
         worker = normalized_workers[0]
-        if worker["tier"] == "standard" and not worker["model"] and not worker["effort"]:
-            worker["tier"] = "cheap"
-            resolve_model_tier(worker, policy)
+        if "tier" not in workers[0] and not worker["model"] and not worker["effort"]:
+            normalized_workers = [{**worker, "tier": "cheap"}]
+    normalized_workers = [resolve_model_tier(worker, policy, settings) for worker in normalized_workers]
 
     return {
         "version": PLAN_VERSION,
@@ -910,11 +2071,11 @@ def validate_custom(worker: Dict[str, Any], worker_id: str) -> Dict[str, Any]:
 
 
 def run_git(
-    cwd: Path, args: Sequence[str], input_bytes: Optional[bytes] = None, timeout: float = 300
+    cwd: Path, args: Sequence[str], input_bytes: Optional[bytes] = None, timeout: float = GIT_TIMEOUT_SECONDS
 ) -> bytes:
     try:
         result = subprocess.run(
-            ["git", "-C", str(cwd), *args],
+            ["git", "--literal-pathspecs", "-C", str(cwd), *args],
             input=input_bytes,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -950,12 +2111,7 @@ def reject_seed_symlinks(path: Path) -> None:
 
 def exclude_worktrees(root: Path) -> None:
     with EXCLUDE_LOCK:
-        ignored = subprocess.run(
-            ["git", "-C", str(root), "check-ignore", "-q", ".alethe/worktrees/probe"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        ).returncode == 0
+        ignored = git_returncode(root, ["check-ignore", "-q", ".alethe/worktrees/probe"]) == 0
         if ignored:
             return
         exclude = Path(run_git(root, ["rev-parse", "--git-path", "info/exclude"]).decode().strip())
@@ -979,33 +2135,56 @@ def prepare_worktree(worker: Dict[str, Any], run_id: str) -> Path:
     target.parent.mkdir(parents=True, exist_ok=True)
     run_git(root, ["worktree", "add", "--detach", str(target), "HEAD"])
 
-    seed_paths: List[str] = worker["seedPaths"]
-    if seed_paths:
-        patch = run_git(root, ["diff", "--binary", "HEAD", "--", *seed_paths])
-        if patch.strip():
-            run_git(target, ["apply", "-"], patch)
-        for relative in seed_paths:
-            source = root / relative
-            if not source.exists() and not source.is_symlink():
-                continue
-            tracked = subprocess.run(
-                ["git", "-C", str(root), "ls-files", "--error-unmatch", "--", relative],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            ).returncode == 0
-            if tracked:
-                continue
-            if not is_inside(source, root):
-                raise PlanError(f"seed path escapes the repository: {relative}")
-            reject_seed_symlinks(source)
-            destination = target / relative
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            if source.is_dir():
-                shutil.copytree(source, destination, symlinks=True, dirs_exist_ok=True)
-            else:
-                shutil.copy2(source, destination, follow_symlinks=False)
+    try:
+        seed_worktree(root, target, worker["seedPaths"])
+    except Exception as error:
+        raise WorktreeSeedError(target, str(error)) from error
     return target
+
+
+class WorktreeSeedError(PlanError):
+    def __init__(self, worktree: Path, message: str) -> None:
+        super().__init__(message)
+        self.worktree = worktree
+
+
+def seed_worktree(root: Path, target: Path, seed_paths: Sequence[str]) -> None:
+    if not seed_paths:
+        return
+    for relative in seed_paths:
+        validate_relative_path(relative, "seedPaths")
+        source = root / relative
+        if not is_inside(source, root):
+            raise PlanError(f"seed path escapes the repository: {relative}")
+        reject_seed_symlinks(source)
+    patch = run_git(root, ["diff", "--binary", "HEAD", "--", *seed_paths])
+    if patch.strip():
+        run_git(target, ["apply", "-"], patch)
+    untracked = run_git(root, ["ls-files", "--others", "--exclude-standard", "-z", "--", *seed_paths])
+    for raw in untracked.split(b"\0"):
+        if not raw:
+            continue
+        relative = raw.decode("utf-8", errors="surrogateescape")
+        source = root / relative
+        if not is_inside(source, root):
+            raise PlanError(f"seed path escapes the repository: {relative}")
+        reject_seed_symlinks(source)
+        destination = target / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination, follow_symlinks=False)
+
+
+def git_returncode(cwd: Path, args: Sequence[str]) -> int:
+    try:
+        return subprocess.run(
+            ["git", "-C", str(cwd), *args],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=GIT_TIMEOUT_SECONDS,
+            check=False,
+        ).returncode
+    except subprocess.TimeoutExpired as error:
+        raise PlanError(f"git {' '.join(args)} timed out after {GIT_TIMEOUT_SECONDS:g}s") from error
 
 
 def command_output(args: Sequence[str], cache: Dict[str, str], lock: threading.Lock) -> str:
@@ -1101,12 +2280,7 @@ def refuse_batch_arguments(args: Sequence[str]) -> None:
 
 
 def in_git_worktree(cwd: Path) -> bool:
-    return subprocess.run(
-        ["git", "-C", str(cwd), "rev-parse", "--is-inside-work-tree"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    ).returncode == 0
+    return git_returncode(cwd, ["rev-parse", "--is-inside-work-tree"]) == 0
 
 
 def build_invocation(
@@ -1242,6 +2416,175 @@ def worker_environment() -> Dict[str, str]:
     return environment
 
 
+def windows_kernel() -> Any:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    signatures = {
+        "CreateJobObjectW": ([ctypes.c_void_p, wintypes.LPCWSTR], wintypes.HANDLE),
+        "SetInformationJobObject": ([wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD], wintypes.BOOL),
+        "AssignProcessToJobObject": ([wintypes.HANDLE, wintypes.HANDLE], wintypes.BOOL),
+        "CloseHandle": ([wintypes.HANDLE], wintypes.BOOL),
+        "OpenProcess": ([wintypes.DWORD, wintypes.BOOL, wintypes.DWORD], wintypes.HANDLE),
+        "GetExitCodeProcess": ([wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)], wintypes.BOOL),
+        "TerminateProcess": ([wintypes.HANDLE, wintypes.UINT], wintypes.BOOL),
+    }
+    for name, (arguments, result) in signatures.items():
+        function = getattr(kernel, name)
+        function.argtypes, function.restype = arguments, result
+    return kernel
+
+
+class WindowsJob:
+    def __init__(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        class BasicLimits(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_longlong), ("PerJobUserTimeLimit", ctypes.c_longlong),
+                ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class IoCounters(ctypes.Structure):
+            _fields_ = [(name, ctypes.c_ulonglong) for name in (
+                "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+                "ReadTransferCount", "WriteTransferCount", "OtherTransferCount",
+            )]
+
+        class ExtendedLimits(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", BasicLimits), ("IoInfo", IoCounters),
+                ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        self.lock = threading.Lock()
+        self.kernel = windows_kernel()
+        self.handle = self.kernel.CreateJobObjectW(None, None)
+        if not self.handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        limits = ExtendedLimits()
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not self.kernel.SetInformationJobObject(
+            self.handle, JOB_OBJECT_EXTENDED_LIMIT_INFORMATION, ctypes.byref(limits), ctypes.sizeof(limits)
+        ):
+            error = ctypes.WinError(ctypes.get_last_error())
+            self.close()
+            raise error
+
+    def assign(self, process: subprocess.Popen) -> None:
+        import ctypes
+
+        if not self.kernel.AssignProcessToJobObject(self.handle, int(process._handle)):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def close(self) -> None:
+        with self.lock:
+            handle, self.handle = self.handle, None
+        if handle:
+            self.kernel.CloseHandle(handle)
+
+
+def resume_windows_process(process: subprocess.Popen) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    resume = ctypes.WinDLL("ntdll").NtResumeProcess
+    resume.argtypes, resume.restype = [wintypes.HANDLE], ctypes.c_long
+    if resume(int(process._handle)) != 0:
+        raise OSError("could not resume suspended worker")
+
+
+def close_process_job(process: subprocess.Popen) -> bool:
+    job = getattr(process, "_alethe_job", None)
+    if job is None:
+        return False
+    job.close()
+    return True
+
+
+def pid_alive(pid: Any) -> bool:
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel = windows_kernel()
+        handle = kernel.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return ctypes.get_last_error() == WINDOWS_ACCESS_DENIED
+        try:
+            code = wintypes.DWORD()
+            return not kernel.GetExitCodeProcess(handle, ctypes.byref(code)) or code.value == STILL_ACTIVE
+        finally:
+            kernel.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def stop_windows_pid(pid: int) -> None:
+    try:
+        result = subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=PROCESS_STOP_TIMEOUT_SECONDS, check=False,
+        )
+        if result.returncode == 0:
+            return
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    if not pid_alive(pid):
+        return
+    import ctypes
+
+    kernel = windows_kernel()
+    handle = kernel.OpenProcess(PROCESS_TERMINATE, False, pid)
+    if not handle:
+        raise PlanError(f"cannot stop worker PID {pid}: {ctypes.WinError(ctypes.get_last_error())}")
+    try:
+        if not kernel.TerminateProcess(handle, 1):
+            raise PlanError(f"cannot stop worker PID {pid}: {ctypes.WinError(ctypes.get_last_error())}")
+    finally:
+        kernel.CloseHandle(handle)
+
+
+def stop_recorded_pid(pid: Any) -> None:
+    if not pid_alive(pid) or pid == os.getpid():
+        return
+    if os.name == "nt":
+        stop_windows_pid(pid)
+        return
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def effective_run_state(state: Dict[str, Any]) -> Dict[str, Any]:
+    runner_pid = state.get("runnerPid")
+    if state.get("status") != "running" or runner_pid is None or pid_alive(runner_pid):
+        return state
+    workers = {
+        key: {**entry, "status": "interrupted"} if entry.get("status") in ("running", "queued") else entry
+        for key, entry in state["workers"].items()
+    }
+    return {**state, "status": "interrupted", "workers": workers}
+
+
 def start_process(
     args: Sequence[str],
     cwd: Path,
@@ -1260,22 +2603,44 @@ def start_process(
         "shell": False,
         "env": env,
     }
+    job = None
     if os.name == "nt":
-        options["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+        try:
+            job = WindowsJob()
+        except OSError:
+            pass
+        if job is not None:
+            # Assign before resuming so descendants inherit job ownership.
+            options["creationflags"] |= WINDOWS_CREATE_SUSPENDED
     else:
         options["start_new_session"] = True
-    return subprocess.Popen(**options)
+    try:
+        process = subprocess.Popen(**options)
+    except BaseException:
+        if job is not None:
+            job.close()
+        raise
+    if job is not None:
+        try:
+            try:
+                job.assign(process)
+                process._alethe_job = job
+            except OSError:
+                job.close()
+            resume_windows_process(process)
+        except BaseException:
+            job.close()
+            process.kill()
+            process.wait()
+            raise
+    return process
 
 
 def stop_process_tree(process: subprocess.Popen) -> None:
     if os.name == "nt":
-        if process.poll() is None:
-            subprocess.run(
-                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            )
+        if not close_process_job(process):
+            stop_windows_pid(process.pid)
     else:
         try:
             os.killpg(process.pid, signal.SIGTERM)
@@ -1329,7 +2694,8 @@ def watch_process(
             stop_process_tree(process)
             return exit_code_of(process), "timed_out"
         try:
-            return process.wait(timeout=min(POLL_SECONDS, remaining)), None
+            code = process.wait(timeout=min(POLL_SECONDS, remaining))
+            return code, "stopped" if stop_path.exists() else None
         except subprocess.TimeoutExpired:
             pass
         if stop_path.exists():
@@ -1344,7 +2710,10 @@ def watch_process(
             return exit_code_of(process), "stalled"
         if now - last_refresh >= STATE_REFRESH_SECONDS:
             last_refresh = now
-            state.update_worker(worker_id, {"outputBytes": size, "idleSeconds": round(now - last_change)})
+            try:
+                state.update_worker(worker_id, {"outputBytes": size, "idleSeconds": round(now - last_change)})
+            except OSError:
+                pass
 
 
 def json_values(text: str, output_format: str) -> List[Any]:
@@ -1453,23 +2822,37 @@ def extract_session(values: Sequence[Any]) -> Optional[str]:
 
 def extract_metrics(values: Sequence[Any]) -> Dict[str, Any]:
     metrics: Dict[str, Any] = {}
+    turns = []
+    final = None
     for value in values:
         if not isinstance(value, dict):
             continue
         usage = value.get("usage") or value.get("tokenUsage") or value.get("token_usage")
-        if isinstance(usage, dict):
-            metrics["usage"] = usage
-        cost = value.get("total_cost_usd")
-        if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+        if isinstance(usage, dict) and usage:
+            metrics["usage"] = normalized_usage(usage)
+            if value.get("type") == "turn.completed":
+                turns.append(normalized_usage(usage))
+            if value.get("type") == "result":
+                final = metrics["usage"]
+        cost = number(value.get("total_cost_usd"))
+        if cost is not None:
             metrics["totalCostUsd"] = cost
+        models = value.get("modelUsage")
+        if isinstance(models, dict):
+            metrics["costByModel"] = {str(model): data["costUSD"] for model, data in models.items()
+                if isinstance(data, dict) and number(data.get("costUSD")) is not None}
         part = value.get("part")
         if isinstance(part, dict):
             tokens = part.get("tokens")
             if isinstance(tokens, dict):
-                metrics["usage"] = tokens
-            part_cost = part.get("cost")
-            if isinstance(part_cost, (int, float)) and not isinstance(part_cost, bool):
+                metrics["usage"] = normalized_usage(tokens)
+            part_cost = number(part.get("cost"))
+            if part_cost is not None:
                 metrics["totalCostUsd"] = part_cost
+    if turns:
+        metrics["usage"] = {key: sum(turn.get(key, 0) for turn in turns) for key in set().union(*turns)}
+    if final is not None:
+        metrics["usage"] = final
     return metrics
 
 
@@ -1500,7 +2883,8 @@ def classify_result(
     if output_format in ("json", "jsonl") and not values:
         return "failed", text, values, "worker output was not valid structured JSON"
     if provider in ("claude", "agy") and values:
-        final = values[-1]
+        final = next((value for value in reversed(values) if not isinstance(value, dict)
+                      or value.get("type") != "rate_limit_event"), None)
         if isinstance(final, dict):
             if final.get("is_error") is True or str(final.get("subtype", "")).startswith("error"):
                 error = f"worker returned {final.get('subtype', 'an error result')}"
@@ -1696,6 +3080,11 @@ class BatchState:
             self.value["workers"][worker_id].update(patch)
             atomic_write_json(self.path, self.value)
 
+    def update_budget(self, usage: Dict[str, Any]) -> None:
+        with self.lock:
+            self.value["budgetUsage"] = usage
+            atomic_write_json(self.path, self.value)
+
     def finish(self, status: str, extra: Optional[Dict[str, Any]] = None) -> None:
         with self.lock:
             self.value["status"] = status
@@ -1708,11 +3097,15 @@ class BatchState:
 class ProcessRegistry:
     def __init__(self) -> None:
         self.processes: Dict[int, subprocess.Popen] = {}
+        self.stopping = False
         self.lock = threading.Lock()
 
     def add(self, process: subprocess.Popen) -> None:
         with self.lock:
             self.processes[process.pid] = process
+            stopping = self.stopping
+        if stopping:
+            stop_process_tree(process)
 
     def remove(self, process: subprocess.Popen) -> None:
         with self.lock:
@@ -1721,6 +3114,7 @@ class ProcessRegistry:
     def stop_all(self) -> None:
         with self.lock:
             processes = list(self.processes.values())
+            self.stopping = True
         for process in processes:
             stop_process_tree(process)
 
@@ -1756,8 +3150,10 @@ class BudgetTracker:
         outer: Optional[Dict[str, Any]] = None,
         max_concurrent: int = 1,
         workers: int = 1,
+        state: Optional[BatchState] = None,
     ) -> None:
         self.budget = budget
+        self.state = state
         self.outer_limits: Dict[str, Any] = (outer or {}).get("limits", {})
         self.outer_used: Dict[str, Any] = (outer or {}).get("used", {})
         self.max_concurrent = max_concurrent
@@ -1825,6 +3221,8 @@ class BudgetTracker:
                     return "budget maxReportedCostUsd leaves less than $0.01 for this worker", None
                 self.reserved[worker_id] = cap
             self.calls += 1
+            if self.state is not None:
+                self.state.update_budget(self.usage_snapshot())
             return None, cap
 
     def finish(self, worker_id: str, metrics: Dict[str, Any]) -> None:
@@ -1841,15 +3239,20 @@ class BudgetTracker:
             if tokens is not None:
                 self.tokens_seen = True
                 self.reported_tokens += tokens
+            if self.state is not None:
+                self.state.update_budget(self.usage_snapshot())
+
+    def usage_snapshot(self) -> Dict[str, Any]:
+        return {
+            "calls": self.calls,
+            "wallSeconds": round(time.monotonic() - self.started_clock, 3),
+            "reportedCostUsd": round(self.reported_cost, 6) if self.cost_seen else None,
+            "reportedTokens": self.reported_tokens if self.tokens_seen else None,
+        }
 
     def usage(self) -> Dict[str, Any]:
         with self.lock:
-            return {
-                "calls": self.calls,
-                "wallSeconds": round(time.monotonic() - self.started_clock, 3),
-                "reportedCostUsd": round(self.reported_cost, 6) if self.cost_seen else None,
-                "reportedTokens": self.reported_tokens if self.tokens_seen else None,
-            }
+            return self.usage_snapshot()
 
 
 def run_worker(
@@ -1909,6 +3312,15 @@ def run_worker(
         outcome.update(fields)
         outcome["finishedAt"] = now_iso()
         outcome["durationSeconds"] = round(time.monotonic() - started_clock, 3)
+        try:
+            policy_path = Path(state.value["policyPath"])
+            if worker["provider"] in QUOTA_PROVIDERS and stdout_path.is_file():
+                values = json_values(stdout_path.read_text(encoding="utf-8", errors="replace"), "jsonl")
+                outcome["quota"] = worker_quota(worker["provider"], values, policy_path)
+            else:
+                save_usage(policy_path, None)
+        except (OSError, PlanError) as error:
+            outcome["quotaError"] = str(error)
         atomic_write_json(outcome_path, outcome)
         state.update_worker(worker_id, outcome)
         return outcome
@@ -1916,6 +3328,14 @@ def run_worker(
     if (run_dir / STOP_FILE).exists():
         tracker.finish(worker_id, {})
         return settle(status="skipped", error="stopped on request", failureKind="stopped")
+    if not state.value.get("allowLowQuota"):
+        try:
+            quota_stop = quota_refusal([worker], Path(state.value["policyPath"]))
+        except (OSError, PlanError):
+            quota_stop = None
+        if quota_stop is not None:
+            tracker.finish(worker_id, {})
+            return settle(status="skipped", error=quota_stop, failureKind="quota_low")
     refusal, cost_cap = tracker.admit(worker_id, worker["provider"] == "claude")
     if refusal is not None:
         tracker.finish(worker_id, {})
@@ -1926,7 +3346,7 @@ def run_worker(
     metrics: Dict[str, Any] = {}
     try:
         cwd = prepare_worktree(worker, run_id) if worker["isolate"] else Path(worker["cwd"])
-        outcome.update(cwd=str(cwd), worktree=str(cwd) if worker["isolate"] else None, costCapUsd=cost_cap)
+        outcome.update(cwd=str(cwd), worktree=str(cwd) if worker["isolate"] else None)
         timeout = worker["timeoutSeconds"]
         remaining_wall = tracker.remaining_wall()
         if remaining_wall is not None:
@@ -1934,6 +3354,8 @@ def run_worker(
         args, stdin_prompt, output_format, result_path = build_invocation(
             worker, cwd, worker_dir, help_cache, help_lock, timeout, cost_cap
         )
+        applied_cost_cap = cost_cap if "--max-budget-usd" in args else None
+        outcome["costCapUsd"] = applied_cost_cap
         before = None
         if not worker["isolate"]:
             root = checkout_root(cwd)
@@ -1947,18 +3369,27 @@ def run_worker(
                 "startedAt": outcome["startedAt"],
                 "cwd": str(cwd),
                 "worktree": outcome["worktree"],
-                "costCapUsd": cost_cap,
+                "costCapUsd": applied_cost_cap,
             },
         )
         with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
             stdin_mode = subprocess.PIPE if stdin_prompt else subprocess.DEVNULL
+            if (run_dir / STOP_FILE).exists():
+                if root is not None:
+                    checkouts.leave(root, worker_id)
+                tracker.finish(worker_id, {})
+                return settle(status="skipped", error="stopped on request", failureKind="stopped")
             process = start_process(args, cwd, stdin_mode, stdout_file, stderr_file, worker_environment())
             registry.add(process)
+            outcome["pid"] = process.pid
+            state.update_worker(worker_id, {"pid": process.pid})
             if stdin_prompt and process.stdin is not None:
                 feed_stdin(process.stdin, worker["task"].encode("utf-8"))
             exit_code, ended = watch_process(
-                process, worker_id, timeout, worker["idleTimeoutSeconds"], (stdout_path, stderr_path), state
+                process, worker_id, timeout, None if worker["provider"] == "agy" else worker["idleTimeoutSeconds"],
+                (stdout_path, stderr_path), state
             )
+            close_process_job(process)
             registry.remove(process)
         overlapped = checkouts.leave(root, worker_id) if root is not None else {}
         status, result_text, values, error = classify_result(
@@ -1984,7 +3415,12 @@ def run_worker(
                 if worker["mode"] == "read-only":
                     violation = bool(touched)
                 else:
-                    dirty_before = sorted(before)[:MAX_LISTED_PATHS]
+                    diff_paths = []
+                    if diff_path is not None:
+                        diff_paths = run_git(cwd, ["diff", "--name-only", "-z", "HEAD"]).decode(
+                            "utf-8", errors="surrogateescape"
+                        ).split("\0")
+                    dirty_before = sorted(set(before).intersection(diff_paths))[:MAX_LISTED_PATHS]
         tracker.finish(worker_id, metrics)
         return settle(
             status=status,
@@ -2014,6 +3450,8 @@ def run_worker(
         if root is not None:
             checkouts.leave(root, worker_id)
         tracker.finish(worker_id, metrics)
+        if isinstance(error, WorktreeSeedError):
+            outcome.update(worktree=str(error.worktree), cwd=str(error.worktree))
         message = str(error)
         return settle(
             status="failed",
@@ -2229,9 +3667,14 @@ def stop_payload(folder: Path) -> Dict[str, Any]:
     running = []
     for run_dir in wave_dirs(folder):
         state = read_optional_json(run_dir / "state.json")
-        if isinstance(state, dict) and state.get("status") == "running":
-            atomic_write_text(run_dir / STOP_FILE, now_iso() + "\n")
-            running.append(str(run_dir))
+        if not isinstance(state, dict) or state.get("status") not in ("running", "interrupted"):
+            continue
+        atomic_write_text(run_dir / STOP_FILE, now_iso() + "\n")
+        for entry in state.get("workers", {}).values():
+            stop_recorded_pid(entry.get("pid"))
+        if effective_run_state(state)["status"] == "interrupted":
+            atomic_write_json(run_dir / "state.json", effective_run_state(state))
+        running.append(str(run_dir))
     return {
         "folder": str(folder),
         "stopping": running,
@@ -2427,11 +3870,18 @@ def mode_reminder(mode: Dict[str, Any], everywhere: bool) -> str:
     if rules:
         parts.append("User rules: " + "; ".join(rules) + ".")
     parts.append(
-        "Follow the alethe-orchestrate skill for each request: do it yourself when that is cheaper, "
+        "Follow the alethe skill for each request: do it yourself when that is cheaper, "
         "delegate bounded units when it pays, and leave any other skill or spec workflow in charge of "
         "its own steps. '/alethe off' turns this off here."
     )
     return " ".join(parts)
+
+
+def hook_stdin() -> str:
+    stream = getattr(sys.stdin, "buffer", None)
+    if stream is None:
+        return sys.stdin.read()
+    return stream.read().decode("utf-8", errors="replace")
 
 
 def hook_output(stdin_text: str) -> str:
@@ -2485,8 +3935,13 @@ def plan_warnings(plan: Dict[str, Any]) -> List[str]:
         )
     for worker in workers:
         name = worker["id"]
-        if worker["provider"] != "custom" and not (worker["model"] or worker["effort"]):
-            warnings.append(f"{name} runs on {worker['provider']}'s default model; pin a tier, model or effort")
+        if worker["provider"] == "agy" and worker["idleTimeoutSeconds"] is not None:
+            warnings.append(f"{name}: agy only emits JSON at completion; idleTimeoutSeconds is ignored")
+        custom_args = worker.get("args", []) if worker["provider"] == "custom" else []
+        if not (worker["model"] or flag_value(custom_args, "--model")):
+            warnings.append(
+                f"{name} runs on {worker['provider']}'s default model, which may be its most expensive; set a tier or a model"
+            )
         if worker["provider"] == "kimi" and worker["mode"] == "read-only":
             warnings.append(
                 f"{name}: Kimi runs prompts with every permission, so read-only rests on the worker contract; "
@@ -2514,19 +3969,129 @@ def default_run_dir() -> Path:
     return Path(tempfile.gettempdir()) / f"alethe-orchestrate-{stamp}-{suffix}"
 
 
+def wait_for_workers(futures: Sequence[concurrent.futures.Future]) -> List[Dict[str, Any]]:
+    pending = set(futures)
+    outcomes = []
+    while pending:
+        done, pending = concurrent.futures.wait(
+            pending, timeout=POLL_SECONDS, return_when=concurrent.futures.FIRST_COMPLETED
+        )
+        outcomes.extend(future.result() for future in done)
+    return outcomes
+
+
+def install_interruption_handlers() -> Dict[int, Any]:
+    if threading.current_thread() is not threading.main_thread():
+        return {}
+    interrupted = False
+
+    def interrupt(signum: int, frame: Any) -> None:
+        nonlocal interrupted
+        if interrupted:
+            return
+        interrupted = True
+        raise KeyboardInterrupt
+
+    names = ("SIGINT", "SIGBREAK") if os.name == "nt" else ("SIGINT", "SIGTERM", "SIGHUP")
+    previous = {}
+    for name in names:
+        signum = getattr(signal, name)
+        previous[signum] = signal.signal(signum, interrupt)
+    return previous
+
+
+def refuse_low_quota(workers: Sequence[Dict[str, Any]], policy_path: Path) -> None:
+    refusal = quota_refusal(workers, policy_path)
+    if refusal is not None:
+        raise PlanError(refusal)
+
+
+def detach_run(
+    plan_path: Path, run_dir: Optional[Path], policy_path: Path, strategy: Optional[str], allow_low_quota: bool = False
+) -> Dict[str, Any]:
+    if os.environ.get(WORKER_ENV_FLAG):
+        raise PlanError("this process is an orchestration worker, and workers cannot start orchestrations")
+    plan = validate_plan(read_json(plan_path), plan_path.resolve(), load_policy(policy_path), strategy)
+    if not allow_low_quota:
+        refuse_low_quota(plan["workers"], policy_path)
+    target = (run_dir or default_run_dir()).expanduser().resolve()
+    if target.exists() and any(target.iterdir()):
+        raise PlanError(f"run directory is not empty: {target}")
+    target.mkdir(parents=True, exist_ok=True)
+    args = [
+        sys.executable, str(Path(__file__).resolve()), "run", str(plan_path.resolve()),
+        "--run-dir", str(target), "--policy", str(policy_path), "--_background",
+    ]
+    if strategy is not None:
+        args += ["--strategy", strategy]
+    if allow_low_quota:
+        args.append("--allow-low-quota")
+    options: Dict[str, Any] = {"shell": False}
+    if os.name == "nt":
+        options["creationflags"] = (
+            subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+        )
+    else:
+        options["start_new_session"] = True
+    with (target / RUNNER_STDOUT_FILE).open("wb") as stdout, (target / RUNNER_STDERR_FILE).open("wb") as stderr:
+        process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=stdout, stderr=stderr, **options)
+    try:
+        atomic_write_json(target / "plan.json", plan_payload(plan, plan_path.resolve(), policy_path, dry_run=False))
+        atomic_write_json(target / "state.json", {
+            "version": STATE_VERSION, "status": "running", "runnerPid": process.pid,
+            "runDir": str(target), "startedAt": now_iso(),
+            "workers": {worker["id"]: {
+                "id": worker["id"], "provider": worker["provider"], "status": "queued",
+            } for worker in plan["workers"]},
+        })
+        set_current(target.parent if (target.parent / ORCHESTRATION_FILE).is_file() else target)
+        process.stdin.write(b"1")
+        process.stdin.close()
+    except BaseException:
+        process.kill()
+        process.wait()
+        raise
+    return {"status": "started", "runDir": str(target), "pid": process.pid}
+
+
+def wait_payload(folder: Optional[Path], timeout: int) -> Dict[str, Any]:
+    if not 0 <= timeout <= MAX_WAIT_SECONDS:
+        raise PlanError(f"--timeout must be between 0 and {MAX_WAIT_SECONDS} seconds")
+    paths = [folder] if folder is not None else []
+    deadline = time.monotonic() + timeout
+    while True:
+        report = build_report(*report_target(paths))
+        done = all(run["status"] != "running" for run in report["runs"])
+        remaining = deadline - time.monotonic()
+        if done or remaining <= 0:
+            return {**report, "done": done}
+        time.sleep(min(POLL_SECONDS, remaining))
+
+
 def run_batch(
     plan_path: Path,
     requested_run_dir: Optional[Path],
     policy_path: Path,
     strategy_override: Optional[str],
+    background: bool = False,
+    allow_low_quota: bool = False,
 ) -> int:
     if os.environ.get(WORKER_ENV_FLAG):
         raise PlanError("this process is an orchestration worker, and workers cannot start orchestrations")
     plan = validate_plan(
-        read_json(plan_path), plan_path.resolve(), load_policy(policy_path), strategy_override
+        read_json(plan_path), plan_path.resolve(), load_policy(policy_path), strategy_override, policy_path
     )
+    if not (allow_low_quota or background):
+        refuse_low_quota(plan["workers"], policy_path)
+    started = dt.datetime.now(dt.timezone.utc)
+    try:
+        save_usage(policy_path, codex_quota())
+        quota_before = saved_usage(policy_path)
+    except (OSError, PlanError):
+        quota_before = {}
     run_dir = (requested_run_dir or default_run_dir()).expanduser().resolve()
-    if run_dir.exists() and any(run_dir.iterdir()):
+    allowed = {RUNNER_STDOUT_FILE, RUNNER_STDERR_FILE, "state.json", "plan.json"} if background else set()
+    if run_dir.exists() and any(path.name not in allowed for path in run_dir.iterdir()):
         raise PlanError(f"run directory is not empty: {run_dir}")
     outer = None
     if requested_run_dir is not None:
@@ -2546,7 +4111,7 @@ def run_batch(
         run_dir / "plan.json", plan_payload(plan, plan_path.resolve(), policy_path, dry_run=False)
     )
     try:
-        set_current(run_dir.parent if requested_run_dir is not None else run_dir)
+        set_current(run_dir.parent if (run_dir.parent / ORCHESTRATION_FILE).is_file() else run_dir)
     except OSError:
         pass
     suffix = run_dir.name[-8:]
@@ -2566,11 +4131,13 @@ def run_batch(
         {
             "version": STATE_VERSION,
             "runId": run_id,
+            "runnerPid": os.getpid(),
             "status": "running",
             "strategy": plan["strategy"],
             "requestedStrategy": plan["requestedStrategy"],
             "maxConcurrent": plan["maxConcurrent"],
             "policyPath": str(policy_path),
+            "allowLowQuota": allow_low_quota,
             "planPath": str(plan_path.resolve()),
             "runDir": str(run_dir),
             "startedAt": now_iso(),
@@ -2584,7 +4151,9 @@ def run_batch(
     help_lock = threading.Lock()
     registry = ProcessRegistry()
     checkouts = CheckoutRegistry()
-    tracker = BudgetTracker(plan["budget"], outer, plan["maxConcurrent"], len(plan["workers"]))
+    tracker = BudgetTracker(plan["budget"], outer, plan["maxConcurrent"], len(plan["workers"]), state)
+    state.update_budget(tracker.usage())
+    previous_signals = install_interruption_handlers()
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=plan["maxConcurrent"])
     futures: List[concurrent.futures.Future] = []
     try:
@@ -2603,22 +4172,31 @@ def run_batch(
             )
             for worker in plan["workers"]
         ]
-        outcomes = [future.result() for future in concurrent.futures.as_completed(futures)]
+        outcomes = wait_for_workers(futures)
     except KeyboardInterrupt:
-        registry.stop_all()
+        try:
+            atomic_write_text(run_dir / STOP_FILE, now_iso() + "\n")
+        finally:
+            registry.stop_all()
         for future in futures:
             future.cancel()
         executor.shutdown(wait=True, cancel_futures=True)
-        state.finish("cancelled", {"budgetUsage": tracker.usage()})
-        print(json.dumps({"status": "cancelled", "runDir": str(run_dir)}))
+        state.finish("interrupted", {"budgetUsage": tracker.usage()})
+        print(json.dumps({"status": "interrupted", "runDir": str(run_dir)}))
         return 130
     finally:
         executor.shutdown(wait=True, cancel_futures=True)
+        for signum, previous in previous_signals.items():
+            signal.signal(signum, previous)
 
     succeeded = sum(outcome["status"] == "succeeded" for outcome in outcomes)
     status = "done" if succeeded == len(outcomes) else "partial" if succeeded else "failed"
     if any(outcome["failureKind"] == "stopped" for outcome in outcomes):
         status = "stopped"
+    try:
+        save_quota_samples(policy_path, quota_samples(plan["workers"], outcomes, quota_before, saved_usage(policy_path), started))
+    except (OSError, PlanError):
+        pass
     budget_usage = tracker.usage()
     state.finish(status, {"budgetUsage": budget_usage})
     print(
@@ -2691,6 +4269,8 @@ def plan_payload(
                 },
             }
         )
+    advisory = preview_usage_cost(workers, policy_path)
+    workers = [{**worker, **estimate} for worker, estimate in zip(workers, advisory["workers"])]
     return {
         "dryRun": dry_run,
         "skillVersion": skill_version(),
@@ -2709,12 +4289,15 @@ def plan_payload(
         "totals": {
             "workers": len(workers),
             "estimatedPromptTokens": sum(worker["estimatedPromptTokens"] for worker in workers),
+            "listPriceEstimateUsd": advisory["total"],
         },
         "estimates": (
             "prompt-only chars/4 heuristic; provider-side context such as repository reads "
             "and tool calls is additional and cannot be estimated"
         ),
-        "warnings": plan_warnings(plan),
+        "listPriceEstimate": {"label": advisory["label"], "asOf": advisory["asOf"]},
+        "quotaForecast": advisory["quotaForecast"],
+        "warnings": plan_warnings(plan) + advisory["warnings"],
     }
 
 
@@ -2754,7 +4337,7 @@ def number(value: Any) -> Optional[float]:
 def cached_tokens(usage: Any) -> Optional[int]:
     if not isinstance(usage, dict):
         return None
-    for key in ("cache_read_input_tokens", "cached_input_tokens"):
+    for key in ("cacheReadTokens", "cache_read_input_tokens", "cached_input_tokens"):
         value = number(usage.get(key))
         if value is not None:
             return int(value)
@@ -2830,6 +4413,7 @@ def collect_run(run_dir: Path) -> Dict[str, Any]:
     state = read_json(run_dir / "state.json")
     if not isinstance(state, dict) or not isinstance(state.get("workers"), dict):
         raise PlanError(f"{run_dir} has no valid state.json")
+    state = effective_run_state(state)
     plan = read_optional_json(run_dir / "plan.json")
     plan = plan if isinstance(plan, dict) else {}
     planned = {
@@ -2874,6 +4458,9 @@ def collect_run(run_dir: Path) -> Dict[str, Any]:
                 "durationSeconds": number(outcome.get("durationSeconds")),
                 "tokens": reported_total_tokens(metrics.get("usage")),
                 "cachedTokens": cached_tokens(metrics.get("usage")),
+                "cacheReadTokens": cached_tokens(metrics.get("usage")),
+                "costByModel": metrics.get("costByModel", {}),
+                "quotaError": outcome.get("quotaError"),
                 "costUsd": number(metrics.get("totalCostUsd")),
                 "sessionId": outcome.get("sessionId"),
                 "worktree": outcome.get("worktree"),
@@ -2938,6 +4525,8 @@ def concerns(worker: Dict[str, Any]) -> List[str]:
     if worker["readOnlyViolation"]:
         touched = list(worker["touchedFiles"] or [])[:5]
         reasons.append(f"it changed the checkout while read-only ({listed(touched)})")
+    if worker.get("quotaError"):
+        reasons.append(f"quota cache failed: {worker['quotaError']}")
     denials = worker["permissionDenials"]
     if denials:
         reasons.append(
@@ -3048,6 +4637,7 @@ def build_report(run_dirs: Sequence[Path], folder: Optional[Path] = None) -> Dic
             "workerStatuses": said,
             "tokens": summed([worker["tokens"] for worker in workers]),
             "cachedTokens": summed([worker["cachedTokens"] for worker in workers]),
+            "cacheReadTokens": summed([worker["cachedTokens"] for worker in workers]),
             "tokensNotReportedBy": silent("tokens"),
             "costUsd": summed([worker["costUsd"] for worker in workers]),
             "costReportedBy": sorted({w["label"] for w in workers if w["costUsd"] is not None}),
@@ -3291,7 +4881,7 @@ def render_markdown(report: Dict[str, Any]) -> str:
     if totals["tokens"] is not None:
         tokens = f"{human_count(totals['tokens'])} reported"
         if totals["cachedTokens"]:
-            tokens += f", {human_count(totals['cachedTokens'])} of them from cache"
+            tokens += f"; {human_count(totals['cachedTokens'])} cache reads separately (excluded from budgets and Value)"
     else:
         tokens = "none reported"
     if totals["tokensNotReportedBy"]:
@@ -3349,7 +4939,7 @@ def render_markdown(report: Dict[str, Any]) -> str:
             lines.append(f"Budget: {budget}.")
         lines.append("")
         with_role = any(worker["why"] for worker in run["workers"])
-        header = ["Worker"] + (["Role"] if with_role else []) + ["Ran on", "Mode", "Status", "Time", "Tokens", "Cost"]
+        header = ["Worker"] + (["Role"] if with_role else []) + ["Ran on", "Mode", "Status", "Time", "Tokens", "Cache reads", "Cost"]
         lines.append("| " + " | ".join(header) + " |")
         lines.append("|" + "|".join(" --- " for _ in header) + "|")
         for worker in run["workers"]:
@@ -3360,6 +4950,7 @@ def render_markdown(report: Dict[str, Any]) -> str:
                 status_text(worker),
                 human_seconds(worker["durationSeconds"]),
                 human_count(worker["tokens"]),
+                human_count(worker["cachedTokens"]),
                 human_cost(worker["costUsd"]),
             ]
             lines.append("| " + " | ".join(row) + " |")
@@ -3559,6 +5150,7 @@ def doctor_payload(policy_path: Path) -> Dict[str, Any]:
         policy = load_policy(policy_path)
     except PlanError as plan_error:
         error = str(plan_error)
+    playbooks = playbook_doctor(policy_path)
     providers = [probe_provider(provider) for provider in BUILTIN_PROVIDERS]
     for entry in providers:
         entry["loggedIn"] = provider_logged_in(entry["provider"], entry["launch"]) if entry["installed"] else None
@@ -3573,11 +5165,18 @@ def doctor_payload(policy_path: Path) -> Dict[str, Any]:
         hints.append("no built-in provider is installed; install one or use provider custom")
     if not policy or not policy["onboarded"]:
         hints.append("orchestration onboarding is incomplete; offer the setup choices")
+    if not playbooks["valid"]:
+        hints.append(playbooks["error"])
+    if policy and policy["modelTiers"]:
+        hints.append(f"policy.modelTiers is deprecated; move it into {user_playbooks_path(policy_path)} tiers")
     if error:
         hints.append(f"saved policy is invalid: {error}")
     elif policy and not policy["budget"]:
         hints.append("no default budget; policy set can add hard limits such as --max-calls")
+    usage = usage_payload(policy_path, refresh=False)
     return {
+        "usage": usage,
+        "usageSummary": usage_summary(usage),
         "skill": {"version": skill_version(), "path": str(Path(__file__).resolve().parent.parent)},
         "python": {"version": sys.version.split()[0], "ok": python_ok},
         "policyPath": str(policy_path),
@@ -3589,6 +5188,7 @@ def doctor_payload(policy_path: Path) -> Dict[str, Any]:
             "budget": policy["budget"] if policy else None,
         },
         "providers": providers,
+        "playbooks": playbooks,
         "installedProviders": installed,
         "hints": hints,
     }
@@ -3709,6 +5309,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     playbook_parser = subparsers.add_parser(
         "playbook", help="print the strategy playbooks the planner follows"
     )
+    playbook_parser.add_argument("id", nargs="?", help="print one playbook and its active settings")
+    playbook_parser.add_argument("--pick", action="store_true", help="print a compact playbook selection index")
+    playbook_parser.add_argument("--json", action="store_true", help="print structured playbook data")
     playbook_parser.add_argument("--policy", type=Path)
     playbook_parser.add_argument("--path", action="store_true", help="print only the effective file path")
     playbook_parser.add_argument("--init", action="store_true", help="copy the bundled playbooks for editing")
@@ -3717,6 +5320,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     probe_parser.add_argument("providers", nargs="*", choices=["codex", "claude", "agy", "kimi"])
     doctor_parser = subparsers.add_parser("doctor", help="check the environment and saved policy")
     doctor_parser.add_argument("--policy", type=Path)
+    for command in ("usage", "models"):
+        information_parser = subparsers.add_parser(command, help=f"show provider {command} as JSON")
+        information_parser.add_argument("--policy", type=Path)
+        information_parser.add_argument("--json", action="store_true", help="JSON output (the default)")
+        if command == "usage":
+            information_parser.add_argument(
+                "--refresh-claude", action="store_true", help="read Claude's quota now with a one-line Haiku call"
+            )
     scaffold_parser = subparsers.add_parser(
         "scaffold", help="print a starter plan for a strategy"
     )
@@ -3739,11 +5350,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     run_parser = subparsers.add_parser("run", help="run a batch plan")
     run_parser.add_argument("plan", type=Path)
     run_parser.add_argument("--run-dir", type=Path)
+    run_parser.add_argument("--detach", action="store_true", help="start the run in the background")
+    run_parser.add_argument("--_background", action="store_true", help=argparse.SUPPRESS)
     run_parser.add_argument(
         "--in", dest="into", metavar="FOLDER", help="add the run as the next wave of an orchestration folder, or 'current'"
     )
     run_parser.add_argument("--policy", type=Path)
     run_parser.add_argument("--strategy", choices=list(STRATEGIES))
+    run_parser.add_argument(
+        "--allow-low-quota", action="store_true", help="start workers past quota.stopAt; only after the user agrees"
+    )
     report_parser = subparsers.add_parser(
         "report", help="explain what runs did, why, and what they reported spending"
     )
@@ -3759,6 +5375,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "status", help="print a few lines on where an orchestration stands, to pick it up again"
     )
     status_parser.add_argument("runs", nargs="*", type=Path)
+    status_parser.add_argument("--policy", type=Path)
+    status_parser.add_argument("--format", choices=["text", "json"], default="text")
+    wait_parser = subparsers.add_parser("wait", help="wait for running waves to finish")
+    wait_parser.add_argument("folder", nargs="?", type=Path)
+    wait_parser.add_argument("--timeout", type=int, default=DEFAULT_WAIT_SECONDS)
     new_parser = subparsers.add_parser("new", help="start an orchestration folder and make it the current one")
     new_parser.add_argument("title")
     new_parser.add_argument("--playbook")
@@ -3830,6 +5451,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 0
         if args.command == "playbook":
             policy_path = (args.policy or default_policy_path()).expanduser().resolve()
+            if (args.init or args.path) and (args.id or args.pick or args.json):
+                raise PlanError("--init and --path cannot be combined with an id, --pick or --json")
             if args.init:
                 print(str(init_playbooks(policy_path, args.force)))
                 return 0
@@ -3837,13 +5460,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if args.path:
                 print(str(path))
                 return 0
-            text = read_playbooks(path)
-            print(f"# source: {path}")
-            print(text, end="" if text.endswith("\n") else "\n")
+            print(playbook_output(policy_path, args.id, args.pick, args.json))
             return 0
         if args.command == "probe":
             providers = args.providers or ["codex", "claude", "agy", "kimi"]
             print(json.dumps([probe_provider(provider) for provider in providers], indent=2))
+            return 0
+        if args.command in ("usage", "models"):
+            policy_path = (args.policy or default_policy_path()).expanduser().resolve()
+            if args.command == "usage" and args.refresh_claude and probe_claude_quota(policy_path) is None:
+                print("warning: Claude printed no rate-limit event, so its quota stays unknown", file=sys.stderr)
+            payload = usage_payload(policy_path) if args.command == "usage" else models_payload(policy_path)
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
             return 0
         if args.command == "doctor":
             policy_path = (args.policy or default_policy_path()).expanduser().resolve()
@@ -3860,7 +5488,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(text, end="")
             return 0
         if args.command == "status":
-            print(render_status(build_report(*report_target(args.runs))), end="")
+            report = build_report(*report_target(args.runs))
+            if args.format == "json":
+                print(json.dumps(report, indent=2, ensure_ascii=False))
+            else:
+                print(render_status(report), end="")
+                policy_path = (args.policy or default_policy_path()).expanduser().resolve()
+                print("\n".join(usage_summary(usage_payload(policy_path, refresh=False))))
+            return 0
+        if args.command == "wait":
+            print(json.dumps(wait_payload(args.folder, args.timeout), indent=2, ensure_ascii=False))
             return 0
         if args.command == "new":
             print(json.dumps(new_orchestration(args.title, args.playbook, args.why), indent=2, ensure_ascii=False))
@@ -3891,7 +5528,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(json.dumps(payload, indent=2, ensure_ascii=False))
             return 0
         if args.command == "hook":
-            print(hook_output(sys.stdin.read()), end="")
+            print(hook_output(hook_stdin()), end="")
             return 0
         if args.command == "stop":
             print(json.dumps(stop_payload(resolve_folder(args.folder)), indent=2))
@@ -3935,6 +5572,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 args.plan.resolve(),
                 load_policy(policy_path),
                 args.strategy,
+                policy_path,
             )
             summary = {
                 "valid": True,
@@ -3964,6 +5602,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 args.plan.resolve(),
                 load_policy(policy_path),
                 args.strategy,
+                policy_path,
             )
             preview = plan_payload(plan, args.plan.resolve(), policy_path)
             if args.write:
@@ -3984,7 +5623,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             raw = read_json(args.plan)
             folder = resolve_folder(None if args.into == "current" else Path(args.into))
             run_dir = next_wave_dir(folder, raw.get("phase") if isinstance(raw, dict) else None)
-        return run_batch(args.plan, run_dir, policy_path, args.strategy)
+        if args.detach:
+            print(json.dumps(detach_run(args.plan, run_dir, policy_path, args.strategy, args.allow_low_quota)))
+            return 0
+        if args._background and sys.stdin.buffer.read(1) != b"1":
+            raise PlanError("detached launcher exited before preparing the run")
+        return run_batch(args.plan, run_dir, policy_path, args.strategy, args._background, args.allow_low_quota)
     except PlanError as error:
         print(f"error: {error}", file=sys.stderr)
         return 2

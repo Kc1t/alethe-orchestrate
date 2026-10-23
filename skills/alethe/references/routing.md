@@ -1,6 +1,6 @@
 # Routing and token policy
 
-Read this reference when deciding whether to delegate, choosing a strategy, or assigning providers.
+Read this reference when deciding whether to delegate, choosing a runner strategy, or assigning providers.
 
 ## Delegate only useful independence
 
@@ -11,11 +11,11 @@ already-produced diff.
 Keep the work with the lead when it is a one-command operation, a uniform batch transformation, a
 small local edit, or a chain where every step depends on the previous one.
 
-## Strategies
+## Runner strategies
 
-| Strategy | Workers | Concurrency | Use |
+| Runner strategy | Workers | Concurrency | Use |
 |---|---:|---:|---|
-| `auto` | inferred | inferred | Choose the smallest strategy that fits the plan |
+| `auto` | inferred | inferred | Choose the smallest runner strategy that fits the plan |
 | `economy` | 1 | 1 | One concise offload with minimum provider usage |
 | `balanced` | up to 4 | 2 | Default independent implementation or investigation |
 | `quality` | 1 per wave | 1 | Writer, reviewer, and repair in separate sequential runs |
@@ -24,8 +24,8 @@ small local edit, or a chain where every step depends on the previous one.
 | `rescue` | 1 | 1 | Resume one interrupted or failed provider session |
 
 The runner enforces these limits rather than relying on the worker prompt. A plan can lower
-concurrency but cannot raise a strategy or saved-policy cap. `performance` remains accepted as a
-legacy alias for `parallel`.
+concurrency but cannot raise a runner strategy or saved-policy cap. `performance` remains
+accepted as a legacy alias for `parallel`.
 
 `auto` infers `rescue` for one resumed worker, `economy` for one new worker, `research` for an
 all-read-only batch, `parallel` for two or more isolated writers, and `balanced` otherwise. It does
@@ -63,11 +63,11 @@ validation with a clear choice, and `automatic` selects the first installed alte
 effort, or resumed session.
 
 `budget` holds default execution limits with the same fields a plan accepts: `maxCalls`,
-`maxWallSeconds`, `maxEstimatedPromptTokens`, and `maxReportedCostUsd`. A plan overrides them
-field by field. When Alethe is installed, its Orchestration preferences own the backend, default
-strategy, provider switching, conserved provider and concurrency, and put the preferred provider
-first in the saved order; `budget`, `modelTiers` and the rest of the order stay as `policy set`
-left them.
+`maxWallSeconds`, `maxEstimatedPromptTokens`, `maxReportedTokens`, and `maxReportedCostUsd`.
+A plan overrides them field by field. When Alethe is installed, its Orchestration preferences own
+the backend, default runner strategy, provider switching, conserved provider and concurrency, and
+put the preferred provider first in the saved order; `budget`, legacy `modelTiers` overrides and
+the rest of the order stay as `policy set` left them.
 
 ```text
 python scripts/orchestrate.py policy set --max-calls 4 --max-wall-seconds 1800
@@ -75,22 +75,22 @@ python scripts/orchestrate.py policy set --max-calls 4 --max-wall-seconds 1800
 
 ## Model tiers
 
-`modelTiers` maps the `cheap` and `strong` tiers to a concrete model or effort per provider:
-
-```text
-python scripts/orchestrate.py policy set --cheap-model claude=haiku kimi=k2-cheap --cheap-effort claude=low
-```
+All three tiers resolve from `tiers` in the effective playbooks file plus the active profile's
+overrides. `playbook <id>` shows the resolved model and effort for each provider and tier.
+Deprecated `policy.modelTiers` entries still win when set, including values saved by
+`policy set --cheap-model`; put new tier choices only in the playbooks copy.
 
 A worker declares `tier: cheap`, `standard` (the default), or `strong` instead of naming a model.
-Because the tier resolves after the provider is chosen, it composes with `provider: auto` — an
-explicit `model` or `effort` pins provider-specific semantics and cannot. A worker cannot combine
-a non-standard tier with an explicit model or effort. When no mapping exists for the chosen
-provider, the worker keeps the provider's default model and `dry-run` says so.
+Because the tier resolves after the provider is chosen, it composes with `provider: auto`. An
+explicit `model` or `effort` pins provider-specific semantics. A worker cannot combine a
+non-standard tier with an explicit model or effort. If the resolved tier leaves the model empty,
+the CLI uses its default; `validate` and `dry-run` warn even when an effort is present.
 
-The `economy` strategy defaults its single worker to `tier: cheap` when the plan pins neither a
-tier nor a model. With no `modelTiers` configured this is a no-op; with one configured it is the
-cheapest run the setup allows. Tiers matter most for single-provider setups: routing between
-providers does nothing when only one CLI is installed, but a cheap tier still cuts cost.
+Runner strategy `economy` defaults its single worker to `tier: cheap` when the plan pins neither
+a tier nor a model. Tiers also cut cost with one provider, where provider switching cannot help.
+Check prices and relative ranks with `models`; missing or stale (>60 days) needed prices must be
+verified on the vendor's official pricing page and saved with `source` and `asOf` in
+`alethe-prices.json`. See [operations.md](operations.md) for billing and estimate rules.
 
 Model names change over time and the runner does not verify them; a misspelled model is a worker
 failure, surfaced in `outcome.json`.
@@ -109,9 +109,14 @@ Use this order:
 6. When quality needs an independent view, review with a different provider or model after the
    implementation exists.
 
-Never infer live quota from a CLI's presence. In skill-only mode, `conserveProviders` is the user's
-explicit signal that a provider should be saved. The runner records usage and cost fields emitted
-by a worker but cannot invent missing quota data.
+Before every wave, run `usage` for Claude worker-event readings and fresh Codex session-file
+readings. Move an unpinned low-provider plan to the next capable provider in the active order at
+the same tier, resolving its model and effort again; apply `quota.whenSpare` when quota would be
+lost. This applies under every goal, profile and runner strategy. User provider pins and hard
+budgets still hold. Never lower a tier to dodge a low provider, and never run into
+`quota.stopAt`: ask the user, with the options in the skill's "Watch the quota" section. Report at most one quota line per wave, disclose stale readings, and record
+changes with `note "<reason and readings>" --kind switch`. See [playbooks.md](playbooks.md) for
+conditions that still need Alethe or the user. Never infer available quota from a CLI's presence.
 
 ## Keep handoffs small
 
@@ -129,4 +134,7 @@ so stale context does not increase cost or bias the answer.
 - Review wave: a separate worker reviews the integrated diff.
 - Repair wave: at most one focused retry or follow-up for a demonstrated issue.
 
-Do not run a reviewer in parallel with the code it must review.
+Start every wave with `run <plan> --in current --detach` and call `wait [--timeout N]` (at most
+540 seconds per call) until `done` is true. Claude Code may use the shell tool's background mode
+instead. Never run a wave in the foreground of a shell tool with a short timeout. Do not run a
+reviewer in parallel with the code it must review.

@@ -16,13 +16,29 @@ from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
-SKILL = ROOT / "skills" / "alethe-orchestrate"
+SKILL = ROOT / "skills" / "alethe"
 SCRIPT = SKILL / "scripts" / "orchestrate.py"
 FAKE = Path(__file__).resolve().parent / "fake_cli.py"
 
 spec = importlib.util.spec_from_file_location("orchestrate", SCRIPT)
 orchestrate = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(orchestrate)
+
+
+QUOTA_HOME = tempfile.TemporaryDirectory(prefix="quota-home-")
+QUOTA_ENVIRONMENT = mock.patch.dict(os.environ, {
+    "CODEX_HOME": str(Path(QUOTA_HOME.name) / "codex"),
+    "ALETHE_ORCHESTRATE_POLICY": str(Path(QUOTA_HOME.name) / "policy.json"),
+})
+
+
+def setUpModule():
+    QUOTA_ENVIRONMENT.start()
+
+
+def tearDownModule():
+    QUOTA_ENVIRONMENT.stop()
+    QUOTA_HOME.cleanup()
 
 
 def remove_tree(path):
@@ -177,7 +193,7 @@ class RunnerTest(Fixtures):
         totals = report["totals"]
         self.assertEqual(totals["runs"], 2)
         self.assertEqual(totals["statuses"], {"succeeded": 3, "failed": 1, "skipped": 1})
-        self.assertEqual(totals["tokens"], 77100)
+        self.assertEqual(totals["tokens"], 19100)
         self.assertEqual(totals["cachedTokens"], 58000)
         self.assertAlmostEqual(totals["costUsd"], 0.0421)
         self.assertEqual(totals["budgetStops"], ["budget maxCalls 2 exhausted"])
@@ -265,7 +281,7 @@ class RunnerTest(Fixtures):
         marketplace = json.loads((ROOT / ".agents" / "plugins" / "marketplace.json").read_text(encoding="utf-8"))
         self.assertEqual(plugin["version"], expected)
         self.assertEqual([entry["version"] for entry in marketplace["plugins"]], [expected])
-        self.assertTrue((ROOT / plugin["skills"] / "alethe-orchestrate" / "SKILL.md").is_file())
+        self.assertTrue((ROOT / plugin["skills"] / "alethe" / "SKILL.md").is_file())
         for readme in ("README.md", "README.pt-BR.md"):
             self.assertIn(f"badge/skill-v{version}-", (ROOT / readme).read_text(encoding="utf-8"))
 
@@ -423,7 +439,7 @@ class GuardTest(Fixtures):
         self.assertEqual(outcome["failureKind"], "rate_limited")
         self.assertIn("resets at 5:00 PM", outcome["resetHint"])
         markdown = self.call("report", run_dir)[1]
-        self.assertIn("The provider hit a usage limit; run the unit on the next provider", markdown)
+        self.assertIn("The provider hit a usage limit; ask the user whether to wait for the reset", markdown)
 
     def test_a_quiet_worker_is_stopped_by_its_idle_timeout(self):
         worker = self.worker("quiet", "read-only", ["sleep", "30"], "text", self.root, idleTimeoutSeconds=5)
@@ -481,11 +497,11 @@ class GuardTest(Fixtures):
         self.assertEqual(self.call("mark", orchestration / "02-build", "missing", "used")[0], 2)
         report = json.loads(self.call("report", orchestration, "--format", "json")[1])
         value = report["totals"]["value"]
-        self.assertEqual((value["used"]["workers"], value["used"]["tokens"], value["used"]["costUsd"]), (["map-callers"], 23000, 0.0421))
-        self.assertEqual((value["discarded"]["workers"], value["discarded"]["tokens"]), (["rename"], 54100))
+        self.assertEqual((value["used"]["workers"], value["used"]["tokens"], value["used"]["costUsd"]), (["map-callers"], 5000, 0.0421))
+        self.assertEqual((value["discarded"]["workers"], value["discarded"]["tokens"]), (["rename"], 14100))
         self.assertEqual(sorted(value["unmarked"]["workers"]), ["add-file", "broken"])
         markdown = self.call("report", orchestration)[1]
-        self.assertIn("- **Value:** 1 result used ($0.04, 23,000 tokens); 1 result discarded (no cost reported, 54,100 tokens); 2 results not marked", markdown)
+        self.assertIn("- **Value:** 1 result used ($0.04, 5,000 tokens); 1 result discarded (no cost reported, 14,100 tokens); 2 results not marked", markdown)
         status = self.call("status", orchestration)[1].splitlines()
         self.assertLessEqual(len(status), 8)
         self.assertEqual(status[1], "Waves: 1. explore partial (1/3); 2. build done (2/2)")
@@ -586,10 +602,8 @@ class GuardTest(Fixtures):
     def test_the_plugin_hook_and_command_point_at_the_runner(self):
         hooks = json.loads((ROOT / "hooks" / "hooks.json").read_text(encoding="utf-8"))
         command = hooks["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
-        self.assertIn("${CLAUDE_PLUGIN_ROOT}/skills/alethe-orchestrate/scripts/orchestrate.py\" hook", command)
-        alethe = (ROOT / "skills" / "alethe" / "SKILL.md").read_text(encoding="utf-8")
-        self.assertIn("$ARGUMENTS", alethe)
-        self.assertIn('"Short commands"', alethe)
+        self.assertIn("${CLAUDE_PLUGIN_ROOT}/skills/alethe/scripts/orchestrate.py\" hook", command)
+        self.assertEqual(sorted(p.name for p in (ROOT / "skills").iterdir()), ["alethe"])
         self.assertIn("## Short commands", (SKILL / "SKILL.md").read_text(encoding="utf-8"))
 
     def test_stop_ends_the_running_worker_and_skips_the_queued_one(self):

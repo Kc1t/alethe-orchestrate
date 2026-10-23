@@ -12,7 +12,7 @@
 
   <p align="center">
     <a href="https://github.com/Kc1t/alethe-orchestrate-skill/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/Kc1t/alethe-orchestrate-skill/actions/workflows/ci.yml/badge.svg"></a>
-    <a href="./CHANGELOG.md"><img alt="Versão da skill" src="https://img.shields.io/badge/skill-v16-4f46e5?style=flat-square"></a>
+    <a href="./CHANGELOG.md"><img alt="Versão da skill" src="https://img.shields.io/badge/skill-v17-4f46e5?style=flat-square"></a>
     <a href="./LICENSE"><img alt="Licença" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square"></a>
     <img alt="Python 3.9+ opcional" src="https://img.shields.io/badge/python-3.9%2B%20optional-3776ab?style=flat-square&logo=python&logoColor=white">
     <img alt="Windows, macOS e Linux" src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-555?style=flat-square">
@@ -41,7 +41,7 @@ codex plugin marketplace add Kc1t/alethe-orchestrate-skill
 codex plugin add alethe-orchestrate@alethe
 ```
 
-Ou copie `skills/alethe-orchestrate` para `~/.claude/skills/`, `~/.codex/skills/` ou
+Ou copie `skills/alethe` para `~/.claude/skills/`, `~/.codex/skills/` ou
 `~/.agents/skills/`.
 
 </details>
@@ -143,6 +143,7 @@ Qualquer outra CLI com modo não interativo, como Kiro, Copilot CLI ou Gemini CL
 
 - **Gasto real, nunca estimado:** tokens e custo como cada CLI informou, separados entre resultados usados e descartados.
 - **Limites aplicados:** orçamento por wave e por orquestração, teto de custo nos workers Claude, sem subagentes.
+- **Nunca deixa a cota estourar:** lê o uso do Claude e do Codex antes de cada wave, não inicia workers passada a linha de parada e te pergunta, com opções, antes de gastar além dela.
 - **Workers enxutos e conferidos:** sem servidores MCP nos workers Codex e Claude, e o git pega um worker só leitura que escreveu.
 - **Fácil de auditar:** só a biblioteca padrão do Python, sem shell, sem rede, sem scripts de instalação.
 
@@ -174,7 +175,7 @@ Qualquer outra CLI com modo não interativo, como Kiro, Copilot CLI ou Gemini CL
 <summary>Comandos do runner e arquivos</summary>
 
 O seu agente roda estes comandos por você, a partir de
-`skills/alethe-orchestrate/scripts/orchestrate.py`:
+`skills/alethe/scripts/orchestrate.py`:
 
 | Etapa | Comando | O que faz |
 | --- | --- | --- |

@@ -12,7 +12,7 @@
 
   <p align="center">
     <a href="https://github.com/Kc1t/alethe-orchestrate-skill/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/Kc1t/alethe-orchestrate-skill/actions/workflows/ci.yml/badge.svg"></a>
-    <a href="./CHANGELOG.md"><img alt="Skill version" src="https://img.shields.io/badge/skill-v16-4f46e5?style=flat-square"></a>
+    <a href="./CHANGELOG.md"><img alt="Skill version" src="https://img.shields.io/badge/skill-v17-4f46e5?style=flat-square"></a>
     <a href="./LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square"></a>
     <img alt="Python 3.9+ optional" src="https://img.shields.io/badge/python-3.9%2B%20optional-3776ab?style=flat-square&logo=python&logoColor=white">
     <img alt="Windows, macOS and Linux" src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-555?style=flat-square">
@@ -41,7 +41,7 @@ codex plugin marketplace add Kc1t/alethe-orchestrate-skill
 codex plugin add alethe-orchestrate@alethe
 ```
 
-Or copy `skills/alethe-orchestrate` into `~/.claude/skills/`, `~/.codex/skills/` or
+Or copy `skills/alethe` into `~/.claude/skills/`, `~/.codex/skills/` or
 `~/.agents/skills/`.
 
 </details>
@@ -143,6 +143,7 @@ Any other CLI with a non-interactive mode, such as Kiro, Copilot CLI or Gemini C
 
 - **Real spend, never estimated:** tokens and cost as each CLI reported them, split between used and discarded results.
 - **Enforced limits:** budgets per wave and per orchestration, a hard cost cap on Claude workers, no subagents.
+- **Never runs your quota dry:** it reads Claude and Codex usage before every wave, refuses to start workers past a stop line, and asks you, with options, before it would spend past it.
 - **Lean, checked workers:** no MCP servers in Codex and Claude workers, and git catches a read-only worker that wrote.
 - **Easy to audit:** Python's standard library only, no shell, no network, no install scripts.
 
@@ -173,7 +174,7 @@ Any other CLI with a non-interactive mode, such as Kiro, Copilot CLI or Gemini C
 <details>
 <summary>Runner commands and files</summary>
 
-Your agent runs these for you, from `skills/alethe-orchestrate/scripts/orchestrate.py`:
+Your agent runs these for you, from `skills/alethe/scripts/orchestrate.py`:
 
 | Stage | Command | What it does |
 | --- | --- | --- |

@@ -1,7 +1,57 @@
 # Changelog
 
-The version is the integer in `skills/alethe-orchestrate/SKILL.md` under `metadata.version`.
+The version is the integer in `skills/alethe/SKILL.md` under `metadata.version`.
 Alethe installs and updates the skill by that number.
+
+## 17 (2026-10-22)
+
+Added:
+
+- `usage` reads real quota without Alethe: Claude's windows from each Claude worker's rate-limit
+  event, Codex's from its own session files. Before every wave the lead checks it and, under any
+  goal or profile, moves work off a provider that is running out, telling the user in one line
+  with the numbers and reset time.
+- A quota stop line, `quota.stopAt` (95%, 90% under savings, 98% under aggressive): `run` refuses
+  a wave on a provider at or past it and skips queued workers once a wave crosses it, unless the
+  user agreed to `--allow-low-quota`. When moving the work would lower the tier it needs, every
+  provider is low, or the forecast passes the line, the lead stops and asks with options: wait for
+  the reset, another provider, a cheaper tier for some units, only the units that fit, or another
+  CLI or account.
+- `dry-run` shows `quotaForecast`, what the wave may take of each window, learned from what past
+  waves took. `usage --refresh-claude` reads Claude's quota now with a one-line Haiku call.
+- `models` and a bundled `prices.json` with official list prices, each with its source and date.
+  A model with no price or a price older than 60 days is looked up on the vendor's pricing page,
+  never guessed, and saved to `alethe-prices.json` with the provider's billing. `dry-run` shows a
+  labeled list-price estimate; the report still shows only what CLIs reported.
+- `playbook --pick` and `playbook <id>` print only what the lead needs, instead of the whole
+  600-line file.
+- `run --detach` and `wait` keep a wave alive past the shell tool's timeout.
+
+Changed:
+
+- The playbooks file is the single source of model tiers: the runner resolves cheap, standard and
+  strong from it and the active profile, so `economy` and the savings profile now take effect.
+  `policy.modelTiers` still wins when set and `doctor` suggests moving it. `validate` and `dry-run`
+  warn when a worker would run on a CLI's default model, and a broken playbooks copy is refused.
+- Cache reads are reported apart and no longer count toward token budgets or the Value split.
+  Codex usage is summed across turns and Claude's cost per model is kept.
+- A short glossary separates playbook, profile, goal and runner strategy.
+- One skill instead of two: the skill is now `alethe` in `skills/alethe`, and the separate `/alethe`
+  shortcut is gone, so installers no longer ask which of the two to install. The plugin keeps the
+  name `alethe-orchestrate`.
+
+Fixed:
+
+- A runner killed by its shell no longer leaves workers running: signals stop the wave, Windows
+  workers run in a Job Object, spend is written as it happens, and `status`, `report` and `stop`
+  detect an interrupted runner and kill its leftover workers.
+- `seedPaths` refuses globs and pathspec magic and copies untracked files inside a tracked folder.
+- The prompt hook reads UTF-8, so projects with accented paths keep their reminder.
+- Windows file replacement retries while another process holds the file, git calls have
+  timeouts, the Claude cost cap is recorded only when it was passed, Agy is no longer killed as
+  idle, and `--run-dir` no longer makes a shared folder current.
+- Docs matched to the code: `mode: read-only`, the `report` default, every wave status and the
+  policy budget fields.
 
 ## 16 (2026-10-21)
 

@@ -12,15 +12,17 @@ python scripts/orchestrate.py probe
 python scripts/orchestrate.py doctor
 python scripts/orchestrate.py strategies
 python scripts/orchestrate.py policy show
+python scripts/orchestrate.py playbook --pick
+python scripts/orchestrate.py playbook scout-then-build
+python scripts/orchestrate.py usage
+python scripts/orchestrate.py models
 python scripts/orchestrate.py scaffold research --workers 3 --cwd .
 python scripts/orchestrate.py validate <plan.json>
 python scripts/orchestrate.py dry-run <plan.json>
 python scripts/orchestrate.py dry-run <plan.json> --write <preview.json>
-python scripts/orchestrate.py run <plan.json>
-python scripts/orchestrate.py run <plan.json> --strategy economy
 python scripts/orchestrate.py new "Rename the login helper" --playbook scout-then-build --why "..."
-python scripts/orchestrate.py run <plan.json> --in current
-python scripts/orchestrate.py run <plan.json> --run-dir <folder>/01-explore
+python scripts/orchestrate.py run <plan.json> --in current --detach
+python scripts/orchestrate.py wait --timeout 60
 python scripts/orchestrate.py budget --max-calls 8 --max-reported-cost-usd 2
 python scripts/orchestrate.py note "review: the diff was three lines" --kind skip
 python scripts/orchestrate.py status
@@ -34,24 +36,56 @@ python scripts/orchestrate.py use <folder>
 
 `doctor` checks the environment before you promise anything: Python version, installed provider
 executables and versions, whether each CLI is logged in (`loggedIn`, or `null` when it cannot
-tell), and whether the saved policy exists, parses, and carries a budget. Its `hints` list says
-what is missing in plain language.
+tell), whether the saved policy exists, parses, and carries a budget, and whether the user's
+playbooks copy is valid. It also summarizes quota. Its `hints` explain what is missing.
 
-`scaffold` prints a starter plan for a strategy so a plan never has to be written from memory.
+`scaffold` prints a starter plan for a runner strategy so a plan never has to be written from memory.
 Worker tasks come back as TODO placeholders to replace, `parallel` workers already carry
 `isolate: true`, and `rescue` requires `--provider` because a resumed session belongs to one
 CLI. Pass `--write <path>` to save it instead of printing.
 
-`dry-run` validates the plan and explains what a run would do — resolved strategy and why,
-effective provider per worker, concurrency, estimated prompt tokens, and the effective budget —
-without starting a worker or creating a worktree. Run it before any strategy you did not pick
-yourself.
+`dry-run` validates the plan and explains what a run would do — resolved runner strategy and why,
+effective provider per worker, concurrency, estimated prompt tokens, the effective budget, and
+`listPriceEstimateUsd`, labeled as an estimate, without starting a worker or creating a worktree.
+Run it before any runner strategy you did not pick yourself.
 
 `validate` and `dry-run` also print `warnings` about money and safety before anything is spent: a
 cost limit that some providers cannot see, a worker on its CLI's default model, several writers
 with briefs so short that each worker's startup costs more than the work, Kimi read-only work, a
 brief that mentions MCP while servers are off, and a writer in a checkout that already has
-uncommitted changes. Fix them or say why they do not apply.
+uncommitted changes. `dry-run` also warns per worker on a low provider. Fix warnings or say why
+they do not apply. An effort alone does not pin a model; default-model warnings still apply.
+
+## Quota and model prices
+
+Before each wave run `usage`. It reads Claude quota from each worker's `rate_limit_event` (only
+as fresh as the last Claude worker) and Codex quota freshly from its own session files, without
+Alethe. `usage --refresh-claude` reads Claude now with a one-line Haiku call, for when Claude's
+reading is missing or stale. `alethe-usage.json` next to the policy caches the readings and the
+per-wave samples behind `dry-run`'s `quotaForecast`. Each provider/window has `usedPercent`,
+`resetsAt`, `ageMinutes`, `low` (>= the active `quota.criticalThreshold`), `blocked`
+(>= `quota.stopAt`), `stale` (>30 minutes), and `reset`. `status` and `doctor` summarize it. Treat
+missing or stale readings as unknown and tell the user when they are stale; see
+[playbooks.md](playbooks.md) for routing rules and the forecast.
+
+`run` and `run --detach` exit with an error naming the provider, window, percent and reset time
+when a worker's provider is blocked, and a running wave skips its queued workers on a provider
+that crosses the line, with `failureKind: quota_low`. Ask the user, as the skill's "Watch the
+quota" section says, before passing `--allow-low-quota`.
+
+`models` lists each provider's models with price, relative `low`/`mid`/`high` rank, `asOf`, and
+`stale` (>60 days) or `missing` flags. The bundled `prices.json` records USD per 1M tokens, with
+an official `source` and `asOf` on every entry. A user copy, `alethe-prices.json` next to the
+policy, overrides bundled entries and holds `billing: {<provider>: "subscription" | "api"}`.
+
+When the plan needs a model whose price is missing or stale, the lead looks it up only on the
+vendor's official pricing page, tells the user, and writes the verified entry, `source` URL and
+`asOf` date into `alethe-prices.json`, preserving other entries and billing choices. Never guess
+or fill an unavailable price. Say it is unknown if the vendor does not publish it.
+
+With subscription billing, quota percent is what is spent; with API billing, the price is.
+`dry-run` uses the table for `listPriceEstimateUsd`, an estimate rather than reported spend or a
+subscription bill. The report continues to show only metrics the CLIs reported.
 
 ## The current orchestration
 
@@ -59,6 +93,13 @@ uncommitted changes. Fix them or say why they do not apply.
 (`ALETHE_ORCHESTRATE_HOME` overrides it), saves the title, playbook and why in
 `orchestration.json`, and makes it current. `run <plan> --in current` adds the next wave as
 `<NN>-<phase>`, so `report` reads every wave together.
+
+Start every wave with `run <plan> --in current --detach`; it returns at once. Then call
+`wait [--timeout N]` until `done` is true. Each wait blocks until the wave ends or its timeout
+(at most 540 seconds), and returns status plus `done`. Choose a timeout within the shell tool's
+limit. In Claude Code the shell tool's background mode is an alternative. Never run a wave in
+the foreground of a shell tool with a short timeout. Interrupted runners are detected; inspect
+`status` before attempting recovery.
 
 `report`, `status`, `budget`, `note`, `stop` and `mark` act on the current orchestration when no
 folder is given. The current one is the folder `new` created, the one `use <folder>` picked, or
@@ -96,7 +137,8 @@ a move to freeform waves, or a step the lead did itself, with the reason.
 
 `stop` writes a `stop` file into every running wave of the orchestration. Each running worker's
 process tree ends within a few seconds with status `stopped`, workers still queued are skipped
-with `failureKind: stopped`, and the wave ends as `stopped`. Results that finished before stay.
+with `failureKind: stopped`, and the wave ends as `stopped`. It also kills leftover worker
+processes after a runner was interrupted. Results that finished before stay.
 
 If Python is unavailable, do not install it without permission. Use the command shapes in
 `references/providers.md` with the host's native background-process facility and reproduce the
@@ -140,9 +182,9 @@ resolved from the plan file's directory.
 never reach the workers. Keep them to one line: `title` up to 120 characters, the plan's `why` up
 to 500, and a worker's `why` up to 300.
 
-A worker may declare `tier: cheap` or `tier: strong` to use the policy-mapped model for its
-provider instead of pinning `model` or `effort` (see `references/routing.md`). Tiers compose
-with `provider: auto`; explicit models do not.
+A worker may declare `tier: cheap`, `standard` or `strong` to use the playbooks and active
+profile's model for its provider (legacy policy overrides still win), instead of pinning `model`
+or `effort` (see [routing.md](routing.md)). Tiers compose with `provider: auto`; explicit models do not.
 
 Codex and Claude workers start without MCP servers; set `mcp: true` on a worker whose brief needs
 one. `idleTimeoutSeconds` (5 to 86400) stops a worker that prints nothing for that long, which
@@ -182,11 +224,13 @@ A plan may carry an optional `budget` object; every field is optional and absent
   anything starts. Provider-side context such as repository reads is additional and not included.
 - `maxReportedCostUsd` gates later workers on the cost earlier workers actually reported. Only
   Claude reports cost, so this limit cannot see Codex, Agy, Kimi or custom workers. Each Claude
-  worker also gets the part of it that is left as `--max-budget-usd`, split across the workers
-  that may run at the same time, so Claude stops a worker that spends its share. The runner does
-  not start a Claude worker when less than $0.01 is left for it.
+  worker also gets the part of it that is left as `--max-budget-usd` when the installed CLI
+  supports that flag, split across concurrent workers, so Claude stops a worker that spends its
+  share. Without the flag, only the gate for later workers applies. The runner does not start a
+  Claude worker when less than $0.01 is left for it.
 - `maxReportedTokens` gates later workers on the tokens earlier workers reported. Codex, Claude
-  and Agy report tokens, so this is the limit that covers the workers that report no cost.
+  and Agy report tokens, so this covers workers that report no cost. Cache reads are separate and
+  excluded from this limit and the Value token split; cache writes still count.
 
 Budget gates are checked when a worker is submitted. With `maxConcurrent` above one, workers
 already running are not retroactively cancelled — the gates stop new work, they do not recall
@@ -204,9 +248,9 @@ at a time in a folder.
 
 The saved policy can hold the same fields as defaults (`policy set --max-calls 4`); a plan
 overrides them field by field. When Alethe is installed, its Orchestration preferences own the
-backend, default strategy, provider switching, conserved provider and concurrency, and put the
-preferred provider first in the saved order; budgets, model tiers and the rest of the order stay
-as `policy set` left them.
+backend, default runner strategy, provider switching, conserved provider and concurrency, and put the
+preferred provider first in the saved order; budgets, legacy `policy.modelTiers` overrides and
+the rest of the order stay as `policy set` left them. New tiers belong in the playbooks copy.
 
 `state.json` records the effective `budget` and a `budgetUsage` block with `calls`,
 `wallSeconds`, `reportedCostUsd`, and `reportedTokens`; the `reported*` fields are `null` when no
@@ -258,16 +302,19 @@ Besides its status, error, session, metrics and diff, `outcome.json` carries:
 - `costCapUsd`, `diffError` and `sharedCheckoutWith`.
 
 The state records both `strategy` and `requestedStrategy`; they differ when `auto` resolves to a
-concrete strategy. Validation also reports `requestedProvider` next to the effective provider when
-automatic switching occurred.
+concrete runner strategy. Validation also reports `requestedProvider` next to the effective
+provider when automatic switching occurred.
 
 An overall status is:
 
 - `done`: every worker succeeded
 - `partial`: at least one succeeded and at least one failed or timed out
 - `failed`: none succeeded
+- `stopped`: stopped by request
+- `cancelled`: cancelled before completion
+- `interrupted`: the runner ended before the wave completed
 
-`plan.json` is the resolved plan, saved when the run starts: the notes, the strategy and why it
+`plan.json` is the resolved plan, saved when the run starts: the notes, the runner strategy and why it
 was chosen, and each worker's provider, model, effort and routing reasons. It never holds task
 text; each worker's `prompt.txt` does.
 
@@ -275,9 +322,9 @@ text; each worker's `prompt.txt` does.
 
 `report` reads a run directory, or a folder holding one run directory per wave, and explains the
 orchestration: what each worker did and why, where it ran, how long it took, the tokens and cost
-its CLI reported, and what is left to review. Without a path it reads the latest run in the
-temporary directory. Markdown is the default; `--format json` returns the same data for tools, and
-`--write <file>` also saves it.
+its CLI reported, and what is left to review. Without a path it prefers the current orchestration;
+only when none is selected does it fall back to the latest temporary run. Markdown is the default;
+`--format json` returns the same data for tools, and `--write <file>` also saves it.
 
 The report never estimates. Claude Code reports tokens and a cost at API prices, Codex reports
 tokens only, and other CLIs report whatever their output carries, often nothing; the report says
@@ -292,11 +339,12 @@ next. With a folder budget, the report adds what every wave used against it.
 `mark [folder] <worker> used|partial|discarded [--why TEXT]` records whether you kept a worker's
 result. Once any result is marked, the report adds a **Value** line that splits the reported cost
 and tokens between results used, partly used and discarded, and lists the ones still unmarked.
-That is how an orchestration shows what its spend bought.
+Cache reads are reported separately and excluded from the Value token split. Reported cost keeps
+what the CLI supplied, including any cache charges; it is never recalculated from the price table.
 
 `status [folder]` prints a few lines: the waves and how they ended, what was spent, the changes
-to the plan, the folder budget, what needs attention, open worktrees and unmarked results. Run it first after the
-conversation is compacted or in a new session, instead of reading the runs again.
+to the plan, the folder budget, what needs attention, open worktrees, unmarked results and a quota
+summary. Run it first after compaction or in a new session, instead of reading the runs again.
 
 ## Worktrees and dirty state
 
@@ -320,10 +368,11 @@ Treat non-zero exit, timeout, invalid structured output, an error result, or an 
 as failure. Read `error` and `failureKind`, then the tail of `stderr.log`. Retry once only when a
 narrower task or corrected invocation addresses a specific cause:
 
-- `rate_limited`: that provider is low for the rest of the orchestration; run the unit on the next
-  provider in the order, or after the reset in `resetHint`.
+- `rate_limited`: that provider is low for the rest of the orchestration. Ask the user whether to
+  wait for the reset in `resetHint` or run the unit on another provider.
+- `quota_low`: the provider reached `quota.stopAt` before the worker started; ask the same way.
 - `auth_required` and `not_installed`: tell the user; another attempt will fail the same way.
-- `timed_out` and `stalled`: resume the session with the rescue strategy, or narrow the task.
+- `timed_out` and `stalled`: resume the session with runner strategy `rescue`, or narrow the task.
 - `budget` and `budget_exceeded`: raise the budget only when the user agrees.
 
 A partial writer diff is untrusted until reviewed.

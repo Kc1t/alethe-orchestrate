@@ -2,8 +2,8 @@
 
 Use this when the user asks to set up the skill or `doctor` finds no saved policy. The result is a
 playbooks copy that lists what the user really has, three profiles built from it, and the user's
-approval. Ask only what you cannot find out; skip answers already given in the request or saved
-policy.
+approval, plus billing choices in `alethe-prices.json` next to the policy. Ask only what you cannot
+find out; skip answers already given or saved in the policy, playbooks or prices copy.
 
 ## 1. Take inventory
 
@@ -21,9 +21,17 @@ policy.
 4. Record a custom adapter only after `--help` shows a non-interactive prompt mode, and write down
    the command you checked. Never guess flags or credentials. A custom adapter cannot enforce
    read-only work, so it only takes writing phases; see [providers.md](providers.md).
-5. Alethe reads Claude, Codex, Antigravity and Kimi usage. Ask about plan end dates, and about the
-   usage of the other CLIs, only when a profile depends on them.
-6. For a route such as 9router, record whether it is installed and running and which CLIs the user
+5. Run `usage`: Claude readings come from worker `rate_limit_event` events and Codex readings from
+   its session files, without Alethe. Antigravity and Kimi still need Alethe or the user; ask for
+   other providers' usage and plan end dates only when quota rules need them. Disclose stale data.
+6. Ask once per provider: "Is <provider> billed by subscription or API?" After approval, save the
+   answer as `billing: {<provider>: "subscription" | "api"}` in `alethe-prices.json` next to the
+   policy, preserving price entries. With subscription billing, quota percent is what is spent;
+   with API billing, the model price is. Skip providers whose billing choice is already saved.
+7. Run `models` for model prices and relative `low`/`mid`/`high` ranks. For any needed missing price
+   or price older than 60 days, look it up only on the vendor's official pricing page, tell the
+   user, and save the entry with `source` and `asOf` in `alethe-prices.json`. Never guess a price.
+8. For a route such as 9router, record whether it is installed and running and which CLIs the user
    wants it to carry. A route is a separate diagram node, not a worker. Inspect the app
    configuration or environment before calling it active, and never start, install or reconfigure
    it.
@@ -32,14 +40,16 @@ policy.
 
 Write three profiles over the same playbooks, using only models the inventory found:
 
-| Profile | Tiers | Order | Switches at |
-| --- | --- | --- | --- |
-| Base | Each CLI's usual model per tier | The user's main CLIs first | 80% |
-| Savings | One step cheaper per tier; low-multiplier and separate quotas for volume | Cheapest capable CLI first, the scarcest subscription last | 70% |
-| Aggressive | One step stronger per tier; `xhigh` still only on escalation | The strongest CLIs first | 95% |
+| Profile | Tiers | Order | Switches at | Stops at |
+| --- | --- | --- | --- | --- |
+| `base` | Each CLI's usual model per tier | The user's main CLIs first | 80% | 95% |
+| `savings` | One step cheaper per tier; low-multiplier and separate quotas for volume | Cheapest capable CLI first, the scarcest subscription last | 70% | 90% |
+| `aggressive` | One step stronger per tier; `xhigh` still only on escalation | The strongest CLIs first | 95% | 98% |
 
-Keep a model empty when the CLI's default is the right choice. Put a read-only phase only where the
-CLI enforces read-only work.
+Choose explicit models where possible. If the user wants a CLI default, leave the model empty and
+explain the `validate`/`dry-run` warning, even when effort is set. Put a read-only phase only where
+the CLI enforces it. Write tiers only to the playbooks copy, never to `policy.modelTiers` or with
+the deprecated `policy set --cheap-model` path; existing policy tier overrides still win.
 
 ## 3. Ask for approval
 
@@ -53,12 +63,14 @@ save or start workers before the user approves.
 1. Run `playbook --init`, adding `--force` only after the user agreed to replace an existing copy,
    and edit the copy it prints: `setup` (date and notes), `providers`, `models`, `adapters`,
    `routes`, `tiers`, `profiles` and `profile`, as [playbooks.md](playbooks.md) describes.
-2. Run `policy set --provider-order` with the active profile's built-in CLIs, or `policy set` with
-   no options when the defaults fit, so `doctor` records onboarding as complete. A choice limited
-   to one run stays out of the policy.
+2. Save the approved provider billing choices in `alethe-prices.json` if not already saved. Run
+   `doctor` to validate the playbooks copy, then `policy set --provider-order` with the active
+   profile's built-in CLIs, or `policy set` with no options when the defaults fit, so `doctor`
+   records onboarding as complete. A choice limited to one run stays out of the policy.
 3. Ask once: "Keep orchestration on in every project, so you never have to call it?" On yes,
-   run `mode on --everywhere` with the goal that matches the active profile: `save` for savings,
-   `max` for aggressive, `balanced` otherwise. It can be turned off per project later.
+   run `mode on --everywhere`. Suggest goal `save` for profile `savings`, goal `max` for profile
+   `aggressive`, or goal `balanced` for profile `base`; the goal controls delegation, independently
+   of the profile's tier models. It can be turned off per project later.
 4. Offer a preview diagram of the active profile.
 
 Later, "use savings" or "go aggressive" changes `profile` in the copy; confirm it when it is an
@@ -70,7 +82,7 @@ These are starting points for a wave's runner strategy, not claims that a model 
 cheapest. Always `probe` before selecting a worker; the local CLI and the user's request take
 precedence.
 
-| Goal | Suggested plan | Typical provider choice |
+| Purpose | Suggested plan | Typical provider choice |
 | --- | --- | --- |
 | Save usage | One bounded reader or writer, `economy`, cheap tier when configured | First available preferred CLI |
 | Everyday work | Two independent units, `balanced` | Codex and Claude Code, or two isolated units on one CLI |
